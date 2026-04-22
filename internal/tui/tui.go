@@ -5,13 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+)
+
+type mode int
+
+const (
+	modeList mode = iota
+	modeNew
+	modeGH
 )
 
 type runInfo struct {
@@ -24,12 +36,21 @@ type runInfo struct {
 }
 
 type model struct {
-	root   string
-	runs   []runInfo
-	cursor int
-	width  int
-	height int
-	err    error
+	root     string // .saturn/runs
+	repoRoot string
+	runs     []runInfo
+	cursor   int
+	width    int
+	height   int
+	err      error
+
+	mode   mode
+	title  textinput.Model
+	shared bool
+	body   textarea.Model
+	ghRef  textinput.Model
+	focus  int // 0=title/ghRef, 1=shared, 2=body
+	flash  string
 }
 
 type tickMsg time.Time
@@ -37,9 +58,26 @@ type refreshMsg struct {
 	runs []runInfo
 	err  error
 }
+type flashMsg string
 
 func Run(runsRoot string) error {
-	m := model{root: runsRoot}
+	repoRoot := filepath.Dir(filepath.Dir(runsRoot)) // .../<repo>/.saturn/runs -> <repo>
+	ti := textinput.New()
+	ti.Placeholder = "short task title"
+	ti.CharLimit = 120
+	ti.Width = 60
+
+	ta := textarea.New()
+	ta.Placeholder = "what should the agent do? use `- [ ]` checklist lines."
+	ta.SetWidth(80)
+	ta.SetHeight(10)
+
+	gh := textinput.New()
+	gh.Placeholder = "owner/repo#123"
+	gh.CharLimit = 120
+	gh.Width = 60
+
+	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -61,24 +99,9 @@ func refreshCmd(root string) tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c", "esc":
-			return m, tea.Quit
-		case "j", "down":
-			if m.cursor < len(m.runs)-1 {
-				m.cursor++
-			}
-		case "k", "up":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "r":
-			return m, refreshCmd(m.root)
-		}
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
 	case tickMsg:
 		return m, tea.Batch(refreshCmd(m.root), tickCmd())
 	case refreshMsg:
@@ -87,8 +110,198 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.runs) {
 			m.cursor = maxInt(0, len(m.runs)-1)
 		}
+		return m, nil
+	case flashMsg:
+		m.flash = string(msg)
+		return m, nil
+	}
+
+	switch m.mode {
+	case modeList:
+		return m.updateList(msg)
+	case modeNew:
+		return m.updateNew(msg)
+	case modeGH:
+		return m.updateGH(msg)
 	}
 	return m, nil
+}
+
+func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
+	km, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch km.String() {
+	case "q", "ctrl+c", "esc":
+		return m, tea.Quit
+	case "j", "down":
+		if m.cursor < len(m.runs)-1 {
+			m.cursor++
+		}
+	case "k", "up":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "r":
+		return m, refreshCmd(m.root)
+	case "n":
+		m.mode = modeNew
+		m.focus = 0
+		m.title.Focus()
+		m.body.Blur()
+		m.flash = ""
+		return m, textinput.Blink
+	case "g":
+		m.mode = modeGH
+		m.ghRef.Focus()
+		m.flash = ""
+		return m, textinput.Blink
+	}
+	return m, nil
+}
+
+func (m model) updateNew(msg tea.Msg) (tea.Model, tea.Cmd) {
+	km, isKey := msg.(tea.KeyMsg)
+	if isKey {
+		switch km.String() {
+		case "esc":
+			m.mode = modeList
+			m.title.Blur()
+			m.body.Blur()
+			return m, nil
+		case "tab":
+			m.focus = (m.focus + 1) % 3
+			m.applyFocus()
+			return m, nil
+		case "shift+tab":
+			m.focus = (m.focus + 2) % 3
+			m.applyFocus()
+			return m, nil
+		case "ctrl+s":
+			return m.submitNew()
+		case " ":
+			if m.focus == 1 {
+				m.shared = !m.shared
+				return m, nil
+			}
+		}
+	}
+	var cmds []tea.Cmd
+	switch m.focus {
+	case 0:
+		var c tea.Cmd
+		m.title, c = m.title.Update(msg)
+		cmds = append(cmds, c)
+	case 2:
+		var c tea.Cmd
+		m.body, c = m.body.Update(msg)
+		cmds = append(cmds, c)
+	}
+	return m, tea.Batch(cmds...)
+}
+
+func (m model) updateGH(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if km, ok := msg.(tea.KeyMsg); ok {
+		switch km.String() {
+		case "esc":
+			m.mode = modeList
+			m.ghRef.Blur()
+			return m, nil
+		case "enter":
+			return m.submitGH()
+		}
+	}
+	var c tea.Cmd
+	m.ghRef, c = m.ghRef.Update(msg)
+	return m, c
+}
+
+func (m *model) applyFocus() {
+	m.title.Blur()
+	m.body.Blur()
+	switch m.focus {
+	case 0:
+		m.title.Focus()
+	case 2:
+		m.body.Focus()
+	}
+}
+
+var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
+
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = slugRe.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = fmt.Sprintf("task-%d", time.Now().Unix())
+	}
+	return s
+}
+
+func (m model) submitNew() (tea.Model, tea.Cmd) {
+	title := strings.TrimSpace(m.title.Value())
+	body := strings.TrimSpace(m.body.Value())
+	if title == "" || body == "" {
+		m.flash = "title and body required"
+		return m, nil
+	}
+	id := slugify(title)
+	content := fmt.Sprintf("---\nid: %s\nshared: %t\n---\n# %s\n%s\n", id, m.shared, title, body)
+	path := filepath.Join(m.repoRoot, "tasks", id+".md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		m.flash = "mkdir: " + err.Error()
+		return m, nil
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		m.flash = "write: " + err.Error()
+		return m, nil
+	}
+	spawnRun(m.repoRoot, path)
+	m.mode = modeList
+	m.title.SetValue("")
+	m.body.SetValue("")
+	m.shared = false
+	m.title.Blur()
+	m.body.Blur()
+	m.flash = "launched " + id
+	return m, refreshCmd(m.root)
+}
+
+func (m model) submitGH() (tea.Model, tea.Cmd) {
+	ref := strings.TrimSpace(m.ghRef.Value())
+	if ref == "" {
+		m.flash = "paste an owner/repo#N ref"
+		return m, nil
+	}
+	spawnRunArg(m.repoRoot, ref)
+	m.mode = modeList
+	m.ghRef.SetValue("")
+	m.ghRef.Blur()
+	m.flash = "launched " + ref
+	return m, refreshCmd(m.root)
+}
+
+func spawnRun(repoRoot, taskPath string) {
+	spawnRunArg(repoRoot, taskPath)
+}
+
+func spawnRunArg(repoRoot, arg string) {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "saturn"
+	}
+	cmd := exec.Command(exe, "run", arg)
+	cmd.Dir = repoRoot
+	logPath := filepath.Join(repoRoot, ".saturn", "tui-spawned.log")
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		cmd.Stdout = lf
+		cmd.Stderr = lf
+	}
+	_ = cmd.Start()
+	go cmd.Wait()
 }
 
 var (
@@ -99,22 +312,28 @@ var (
 	okBadge    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	errBadge   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	runBadge   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
+	boxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 )
 
 func (m model) View() string {
+	switch m.mode {
+	case modeNew:
+		return m.viewNew()
+	case modeGH:
+		return m.viewGH()
+	}
+	return m.viewList()
+}
+
+func (m model) viewList() string {
 	if m.err != nil {
 		return fmt.Sprintf("error: %v (press q to quit)", m.err)
 	}
-	if len(m.runs) == 0 {
-		return titleStyle.Render("saturn watch") + "\n\n" +
-			dim.Render("no runs found under "+m.root+"\n\npress q to quit")
-	}
-
 	w, h := m.width, m.height
 	if w == 0 {
 		w, h = 100, 30
 	}
-
 	left := w / 3
 	if left < 30 {
 		left = 30
@@ -126,7 +345,14 @@ func (m model) View() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · refresh 2s · j/k r q", len(m.runs))) + "\n\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g github · r refresh · q quit", len(m.runs))) + "\n")
+	if m.flash != "" {
+		lb.WriteString(okBadge.Render(m.flash) + "\n")
+	}
+	lb.WriteString("\n")
+	if len(m.runs) == 0 {
+		lb.WriteString(dim.Render("no runs yet") + "\n")
+	}
 	for i, r := range m.runs {
 		line := fmt.Sprintf("%s %-20s %s", badge(r), truncate(r.ID, 20), dim.Render(fmt.Sprintf("iter=%d", r.Iterations)))
 		if i == m.cursor {
@@ -138,7 +364,7 @@ func (m model) View() string {
 	}
 
 	var rb strings.Builder
-	if m.cursor < len(m.runs) {
+	if len(m.runs) > 0 && m.cursor < len(m.runs) {
 		sel := m.runs[m.cursor]
 		rb.WriteString(titleStyle.Render(sel.ID) + "\n")
 		rb.WriteString(dim.Render(fmt.Sprintf("stop=%s ended=%s", sel.StopReason, sel.EndedAt)) + "\n")
@@ -150,10 +376,41 @@ func (m model) View() string {
 			rb.WriteString(truncate(ln, right) + "\n")
 		}
 	}
-
 	leftBlock := lipgloss.NewStyle().Width(left).Height(h - 1).Render(lb.String())
 	rightBlock := lipgloss.NewStyle().Width(right).Height(h - 1).Render(rb.String())
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, " │ ", rightBlock)
+}
+
+func (m model) viewNew() string {
+	sharedLabel := "[ ] shared worktree"
+	if m.shared {
+		sharedLabel = "[x] shared worktree"
+	}
+	sharedStyled := sharedLabel
+	if m.focus == 1 {
+		sharedStyled = rowSel.Render(sharedLabel)
+	}
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("new task") + "\n\n")
+	b.WriteString(labelStyle.Render("title") + "\n" + m.title.View() + "\n\n")
+	b.WriteString(labelStyle.Render("shared") + "  " + sharedStyled + dim.Render("  (space to toggle)") + "\n\n")
+	b.WriteString(labelStyle.Render("body") + "\n" + m.body.View() + "\n\n")
+	if m.flash != "" {
+		b.WriteString(errBadge.Render(m.flash) + "\n")
+	}
+	b.WriteString(dim.Render("tab next · shift+tab prev · ctrl+s submit · esc cancel"))
+	return boxStyle.Render(b.String())
+}
+
+func (m model) viewGH() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("launch from github issue") + "\n\n")
+	b.WriteString(labelStyle.Render("ref") + "\n" + m.ghRef.View() + "\n\n")
+	if m.flash != "" {
+		b.WriteString(errBadge.Render(m.flash) + "\n")
+	}
+	b.WriteString(dim.Render("enter submit · esc cancel"))
+	return boxStyle.Render(b.String())
 }
 
 func badge(r runInfo) string {
