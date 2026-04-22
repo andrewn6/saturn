@@ -33,6 +33,8 @@ type runInfo struct {
 	EndedAt    string
 	Error      string
 	TailLines  []string
+	SessionID  string
+	Workdir    string
 }
 
 type model struct {
@@ -157,8 +159,29 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ghRef.Focus()
 		m.flash = ""
 		return m, textinput.Blink
+	case "o":
+		return m.openClaude()
 	}
 	return m, nil
+}
+
+func (m model) openClaude() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return m, nil
+	}
+	sel := m.runs[m.cursor]
+	if sel.SessionID == "" {
+		m.flash = "no session id yet (first iteration not complete)"
+		return m, nil
+	}
+	cmd := exec.Command("claude", "--resume", sel.SessionID)
+	cmd.Dir = sel.Workdir
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return flashMsg("claude exited: " + err.Error())
+		}
+		return flashMsg("resumed session " + truncate(sel.SessionID, 8))
+	})
 }
 
 func (m model) updateNew(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -345,7 +368,7 @@ func (m model) viewList() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g github · r refresh · q quit", len(m.runs))) + "\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g github · o open · r refresh · q quit", len(m.runs))) + "\n")
 	if m.flash != "" {
 		lb.WriteString(okBadge.Render(m.flash) + "\n")
 	}
@@ -457,6 +480,13 @@ func loadRuns(root string) ([]runInfo, error) {
 			continue
 		}
 		info.ID = e.Name()
+		repoRoot := filepath.Dir(filepath.Dir(root))
+		wt := filepath.Join(repoRoot, ".saturn", "wt", e.Name())
+		if st, err := os.Stat(wt); err == nil && st.IsDir() {
+			info.Workdir = wt
+		} else {
+			info.Workdir = repoRoot
+		}
 		out = append(out, info)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].EndedAt > out[j].EndedAt })
@@ -479,7 +509,34 @@ func loadRun(dir string) (runInfo, error) {
 		r.Error = res.Error
 	}
 	r.TailLines = tailEvents(filepath.Join(dir, "events.jsonl"), 40)
+	r.SessionID = firstSessionID(filepath.Join(dir, "events.jsonl"))
 	return r, nil
+}
+
+func firstSessionID(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+	for sc.Scan() {
+		var ev struct {
+			Raw struct {
+				Type      string `json:"type"`
+				Subtype   string `json:"subtype"`
+				SessionID string `json:"session_id"`
+			} `json:"raw"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+			continue
+		}
+		if ev.Raw.Type == "system" && ev.Raw.Subtype == "init" && ev.Raw.SessionID != "" {
+			return ev.Raw.SessionID
+		}
+	}
+	return ""
 }
 
 func tailEvents(path string, n int) []string {
