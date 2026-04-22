@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/ActiveState/vt10x"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/creack/pty"
 )
 
@@ -78,29 +80,98 @@ func (s *Session) Resize(cols, rows int) error {
 	return pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 }
 
-// Render returns the current emulator screen as newline-joined text.
-// Monochrome for MVP; colors discarded.
+// Render returns the current emulator screen with color + cursor overlay as
+// a single string containing ANSI SGR escapes. The caller should emit it
+// verbatim; Bubble Tea's renderer passes ANSI through unchanged.
 func (s *Session) Render() string {
 	s.state.Lock()
 	defer s.state.Unlock()
 	rows, cols := s.state.Size()
-	lines := make([]string, 0, rows)
+	cx, cy := s.state.Cursor()
+	showCursor := s.state.CursorVisible()
+
+	var out strings.Builder
 	for y := 0; y < rows; y++ {
-		var b strings.Builder
-		b.Grow(cols)
-		for x := 0; x < cols; x++ {
-			ch, _, _ := s.state.Cell(x, y)
-			if ch == 0 {
-				ch = ' '
-			}
-			b.WriteRune(ch)
+		out.WriteString(renderRow(s.state, y, cols, cx, cy, showCursor))
+		if y < rows-1 {
+			out.WriteByte('\n')
 		}
-		lines = append(lines, strings.TrimRight(b.String(), " "))
 	}
-	for len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	return strings.TrimRight(out.String(), "\n")
+}
+
+// renderRow emits one screen row, grouping contiguous cells with identical
+// (fg, bg) into a single lipgloss span. Overlays the cursor cell with
+// reverse video.
+func renderRow(st *vt10x.State, y, cols, cx, cy int, showCursor bool) string {
+	var out strings.Builder
+	var runBuf strings.Builder
+	var runFG, runBG vt10x.Color
+	runInit := false
+
+	flush := func() {
+		if runBuf.Len() == 0 {
+			return
+		}
+		out.WriteString(styleFor(runFG, runBG, false).Render(runBuf.String()))
+		runBuf.Reset()
 	}
-	return strings.Join(lines, "\n")
+
+	for x := 0; x < cols; x++ {
+		ch, fg, bg := st.Cell(x, y)
+		if ch == 0 {
+			ch = ' '
+		}
+		isCursor := showCursor && x == cx && y == cy
+		if isCursor {
+			// Flush current run, emit cursor cell by itself.
+			flush()
+			out.WriteString(styleFor(fg, bg, true).Render(string(ch)))
+			runInit = false
+			continue
+		}
+		if !runInit || fg != runFG || bg != runBG {
+			flush()
+			runFG, runBG, runInit = fg, bg, true
+		}
+		runBuf.WriteRune(ch)
+	}
+	flush()
+	return strings.TrimRight(out.String(), " ")
+}
+
+// styleFor maps a vt10x cell's (fg, bg) to a lipgloss style. If reverse is
+// true, swaps fg/bg to emulate a cursor/selected cell.
+func styleFor(fg, bg vt10x.Color, reverse bool) lipgloss.Style {
+	s := lipgloss.NewStyle()
+	fgColor, fgOk := cellColor(fg)
+	bgColor, bgOk := cellColor(bg)
+	if reverse {
+		fgOk, bgOk = bgOk, fgOk
+		fgColor, bgColor = bgColor, fgColor
+		if !fgOk && !bgOk {
+			// No cell colors at all → use terminal reverse.
+			return s.Reverse(true)
+		}
+	}
+	if fgOk {
+		s = s.Foreground(fgColor)
+	}
+	if bgOk {
+		s = s.Background(bgColor)
+	}
+	return s
+}
+
+// cellColor translates a vt10x.Color to a lipgloss.Color. Returns ok=false
+// when the color is the terminal default (0xff80 / 0xff81) so callers can
+// skip setting it and inherit the host palette.
+func cellColor(c vt10x.Color) (lipgloss.Color, bool) {
+	// DefaultFG == 0xff80, DefaultBG == 0xff81 per vt10x constants.
+	if uint16(c) >= 0xff80 {
+		return "", false
+	}
+	return lipgloss.Color(strconv.Itoa(int(c))), true
 }
 
 // Done fires when the child exits.

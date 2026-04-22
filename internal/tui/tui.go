@@ -57,7 +57,8 @@ type model struct {
 	focus  int // 0=title/ghRef, 1=shared, 2=body
 	flash  string
 
-	session *ptty.Session
+	sessions     map[string]*ptty.Session
+	activeTaskID string
 }
 
 type pttyTickMsg struct{}
@@ -87,7 +88,7 @@ func Run(runsRoot string) error {
 	gh.CharLimit = 120
 	gh.Width = 60
 
-	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh}
+	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh, sessions: map[string]*ptty.Session{}}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -140,19 +141,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func pttyTickCmd() tea.Cmd {
-	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return pttyTickMsg{} })
+	return tea.Tick(33*time.Millisecond, func(time.Time) tea.Msg { return pttyTickMsg{} })
+}
+
+func (m model) active() *ptty.Session {
+	if m.activeTaskID == "" {
+		return nil
+	}
+	return m.sessions[m.activeTaskID]
 }
 
 func (m model) updateAttached(msg tea.Msg) (tea.Model, tea.Cmd) {
+	sess := m.active()
 	switch msg := msg.(type) {
 	case pttyTickMsg:
-		if m.session == nil {
+		if sess == nil {
+			m.mode = modeList
 			return m, nil
 		}
 		select {
-		case <-m.session.Done():
-			_ = m.session.Close()
-			m.session = nil
+		case <-sess.Done():
+			delete(m.sessions, m.activeTaskID)
+			m.activeTaskID = ""
 			m.mode = modeList
 			m.flash = "session ended"
 			return m, refreshCmd(m.root)
@@ -160,29 +170,36 @@ func (m model) updateAttached(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, pttyTickCmd()
 	case tea.WindowSizeMsg:
-		if m.session != nil {
-			_ = m.session.Resize(msg.Width, msg.Height-1)
+		if sess != nil {
+			_ = sess.Resize(msg.Width, msg.Height-1)
 		}
 		return m, nil
 	case tea.KeyMsg:
-		// Detach: F12 returns to dashboard, keeps child running? No — we
-		// don't have a supervisor so detaching would orphan it; instead F12
-		// kills and returns. Clear exit UX beats half-working background.
-		if msg.Type == tea.KeyF12 {
-			if m.session != nil {
-				_ = m.session.Close()
-				m.session = nil
-			}
+		switch msg.Type {
+		case tea.KeyF12:
+			// Detach — keep child running, return to dashboard.
+			id := m.activeTaskID
+			m.activeTaskID = ""
 			m.mode = modeList
-			m.flash = "detached (session killed)"
+			m.flash = "detached " + id + " (still running; press o to reattach)"
+			return m, refreshCmd(m.root)
+		case tea.KeyF10:
+			// Hard kill + detach.
+			if sess != nil {
+				_ = sess.Close()
+				delete(m.sessions, m.activeTaskID)
+			}
+			m.activeTaskID = ""
+			m.mode = modeList
+			m.flash = "killed session"
 			return m, refreshCmd(m.root)
 		}
-		if m.session == nil {
+		if sess == nil {
 			return m, nil
 		}
 		b := ptty.EncodeKey(msg)
 		if len(b) > 0 {
-			_, _ = m.session.Write(b)
+			_, _ = sess.Write(b)
 		}
 		return m, nil
 	}
@@ -317,18 +334,32 @@ func (m model) openClaude() (tea.Model, tea.Cmd) {
 		m.flash = "no session id yet (first iteration not complete)"
 		return m, nil
 	}
-	cmd := exec.Command("claude", "--resume", sel.SessionID)
-	cmd.Dir = sel.Workdir
 	cols, rows := m.width, m.height-1
 	if cols <= 0 {
 		cols, rows = 120, 40
 	}
+	// Reuse existing live session if present.
+	if existing, ok := m.sessions[sel.ID]; ok {
+		select {
+		case <-existing.Done():
+			delete(m.sessions, sel.ID)
+		default:
+			_ = existing.Resize(cols, rows)
+			m.activeTaskID = sel.ID
+			m.mode = modeAttached
+			m.flash = ""
+			return m, pttyTickCmd()
+		}
+	}
+	cmd := exec.Command("claude", "--resume", sel.SessionID)
+	cmd.Dir = sel.Workdir
 	sess, err := ptty.New(cmd, cols, rows)
 	if err != nil {
 		m.flash = "attach failed: " + err.Error()
 		return m, nil
 	}
-	m.session = sess
+	m.sessions[sel.ID] = sess
+	m.activeTaskID = sel.ID
 	m.mode = modeAttached
 	m.flash = ""
 	return m, pttyTickCmd()
@@ -502,11 +533,12 @@ func (m model) View() string {
 }
 
 func (m model) viewAttached() string {
-	if m.session == nil {
+	sess := m.active()
+	if sess == nil {
 		return "no session"
 	}
-	screen := m.session.Render()
-	footer := dim.Render("[attached · F12 detach + kill]")
+	screen := sess.Render()
+	footer := dim.Render("[attached " + m.activeTaskID + " · F12 detach · F10 kill]")
 	return screen + "\n" + footer
 }
 
