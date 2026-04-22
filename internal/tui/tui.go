@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/ptty"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -25,6 +26,7 @@ const (
 	modeList mode = iota
 	modeNew
 	modeGH
+	modeAttached
 )
 
 type runInfo struct {
@@ -54,7 +56,12 @@ type model struct {
 	ghRef  textinput.Model
 	focus  int // 0=title/ghRef, 1=shared, 2=body
 	flash  string
+
+	session *ptty.Session
 }
+
+type pttyTickMsg struct{}
+type pttyDoneMsg struct{}
 
 type tickMsg time.Time
 type refreshMsg struct {
@@ -126,6 +133,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateNew(msg)
 	case modeGH:
 		return m.updateGH(msg)
+	case modeAttached:
+		return m.updateAttached(msg)
+	}
+	return m, nil
+}
+
+func pttyTickCmd() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return pttyTickMsg{} })
+}
+
+func (m model) updateAttached(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case pttyTickMsg:
+		if m.session == nil {
+			return m, nil
+		}
+		select {
+		case <-m.session.Done():
+			_ = m.session.Close()
+			m.session = nil
+			m.mode = modeList
+			m.flash = "session ended"
+			return m, refreshCmd(m.root)
+		default:
+		}
+		return m, pttyTickCmd()
+	case tea.WindowSizeMsg:
+		if m.session != nil {
+			_ = m.session.Resize(msg.Width, msg.Height-1)
+		}
+		return m, nil
+	case tea.KeyMsg:
+		// Detach: F12 returns to dashboard, keeps child running? No — we
+		// don't have a supervisor so detaching would orphan it; instead F12
+		// kills and returns. Clear exit UX beats half-working background.
+		if msg.Type == tea.KeyF12 {
+			if m.session != nil {
+				_ = m.session.Close()
+				m.session = nil
+			}
+			m.mode = modeList
+			m.flash = "detached (session killed)"
+			return m, refreshCmd(m.root)
+		}
+		if m.session == nil {
+			return m, nil
+		}
+		b := ptty.EncodeKey(msg)
+		if len(b) > 0 {
+			_, _ = m.session.Write(b)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -260,12 +319,19 @@ func (m model) openClaude() (tea.Model, tea.Cmd) {
 	}
 	cmd := exec.Command("claude", "--resume", sel.SessionID)
 	cmd.Dir = sel.Workdir
-	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-		if err != nil {
-			return flashMsg("claude exited: " + err.Error())
-		}
-		return flashMsg("resumed session " + truncate(sel.SessionID, 8))
-	})
+	cols, rows := m.width, m.height-1
+	if cols <= 0 {
+		cols, rows = 120, 40
+	}
+	sess, err := ptty.New(cmd, cols, rows)
+	if err != nil {
+		m.flash = "attach failed: " + err.Error()
+		return m, nil
+	}
+	m.session = sess
+	m.mode = modeAttached
+	m.flash = ""
+	return m, pttyTickCmd()
 }
 
 func (m model) updateNew(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -429,8 +495,19 @@ func (m model) View() string {
 		return m.viewNew()
 	case modeGH:
 		return m.viewGH()
+	case modeAttached:
+		return m.viewAttached()
 	}
 	return m.viewList()
+}
+
+func (m model) viewAttached() string {
+	if m.session == nil {
+		return "no session"
+	}
+	screen := m.session.Render()
+	footer := dim.Render("[attached · F12 detach + kill]")
+	return screen + "\n" + footer
 }
 
 func (m model) viewList() string {
