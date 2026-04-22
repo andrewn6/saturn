@@ -169,8 +169,83 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openEditor()
 	case "K":
 		return m.killSession()
+	case "d":
+		return m.openDiff()
+	case "D":
+		return m.openDiffSummary()
 	}
 	return m, nil
+}
+
+func (m model) openDiff() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return m, nil
+	}
+	sel := m.runs[m.cursor]
+	branch := "saturn/" + sel.ID
+	if !branchExists(m.repoRoot, branch) {
+		// Shared-mode task: show last 20 commits of current branch.
+		return m, runInPager(m.repoRoot,
+			"git log --oneline -20 && echo '--- diff HEAD~20..HEAD ---' && git diff HEAD~20..HEAD")
+	}
+	return m, runInPager(m.repoRoot, fmt.Sprintf("git diff main..%s", shellQuote(branch)))
+}
+
+func (m model) openDiffSummary() (tea.Model, tea.Cmd) {
+	branches := saturnBranches(m.repoRoot)
+	if len(branches) == 0 {
+		m.flash = "no saturn/* branches yet"
+		return m, nil
+	}
+	var script strings.Builder
+	script.WriteString("echo 'saturn agent diffs · q to quit'; echo; ")
+	for _, b := range branches {
+		script.WriteString(fmt.Sprintf("echo '=== %s ==='; git diff --stat main..%s; echo; ",
+			b, shellQuote(b)))
+	}
+	return m, runInPager(m.repoRoot, script.String())
+}
+
+func branchExists(repoRoot, name string) bool {
+	cmd := exec.Command("git", "-C", repoRoot, "show-ref", "--verify", "--quiet", "refs/heads/"+name)
+	return cmd.Run() == nil
+}
+
+func saturnBranches(repoRoot string) []string {
+	cmd := exec.Command("git", "-C", repoRoot, "for-each-ref",
+		"--format=%(refname:short)", "refs/heads/saturn/")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var bs []string
+	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln != "" {
+			bs = append(bs, ln)
+		}
+	}
+	return bs
+}
+
+func runInPager(workdir, shellScript string) tea.Cmd {
+	pager := os.Getenv("PAGER")
+	if pager == "" {
+		pager = "less -R"
+	}
+	full := fmt.Sprintf("%s | %s", shellScript, pager)
+	cmd := exec.Command("sh", "-c", full)
+	cmd.Dir = workdir
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return flashMsg("pager: " + err.Error())
+		}
+		return flashMsg("")
+	})
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func (m model) openClaude() (tea.Model, tea.Cmd) {
@@ -482,7 +557,7 @@ func (m model) viewList() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o attach · w shell · K kill-tmux · r refresh · q quit", len(m.runs))) + "\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o attach · w shell · d diff · D all-diffs · K kill · r refresh · q quit", len(m.runs))) + "\n")
 	if m.flash != "" {
 		lb.WriteString(okBadge.Render(m.flash) + "\n")
 	}
