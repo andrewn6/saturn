@@ -17,6 +17,7 @@ import (
 	"github.com/andrewn6/saturn/internal/loop"
 	"github.com/andrewn6/saturn/internal/runner"
 	"github.com/andrewn6/saturn/internal/task"
+	"github.com/andrewn6/saturn/internal/tui"
 	"github.com/andrewn6/saturn/internal/worktree"
 )
 
@@ -31,14 +32,33 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "watch":
+		if err := watchCmd(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
 }
 
+func watchCmd() error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	root, err := worktree.RepoRoot(cwd)
+	if err != nil {
+		return err
+	}
+	return tui.Run(filepath.Join(root, ".saturn", "runs"))
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: saturn run [--max-iter N] [--parallel N] <task.md> [task.md...]")
+	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  saturn run [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn watch")
 }
 
 func runCmd(args []string) error {
