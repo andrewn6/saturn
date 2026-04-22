@@ -3,13 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/assets"
+	"github.com/andrewn6/saturn/internal/beads"
+	"github.com/andrewn6/saturn/internal/loop"
 	"github.com/andrewn6/saturn/internal/runner"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/worktree"
@@ -22,11 +27,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "run":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: saturn run <task.md>")
-			os.Exit(2)
-		}
-		if err := runCmd(os.Args[2]); err != nil {
+		if err := runCmd(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -37,13 +38,36 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: saturn run <task.md>")
+	fmt.Fprintln(os.Stderr, "usage: saturn run [--max-iter N] [--parallel N] <task.md> [task.md...]")
 }
 
-func runCmd(taskPath string) error {
-	t, err := task.ParseFile(taskPath)
-	if err != nil {
+func runCmd(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	maxIter := fs.Int("max-iter", 20, "max loop iterations per task (0 = unlimited)")
+	parallel := fs.Int("parallel", 3, "max concurrent tasks")
+	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() == 0 {
+		usage()
+		return fmt.Errorf("no tasks provided")
+	}
+
+	var tasks []*task.Task
+	for _, p := range fs.Args() {
+		var (
+			t   *task.Task
+			err error
+		)
+		if task.IsGitHubRef(p) {
+			t, err = task.FromGitHub(p)
+		} else {
+			t, err = task.ParseFile(p)
+		}
+		if err != nil {
+			return fmt.Errorf("load %s: %w", p, err)
+		}
+		tasks = append(tasks, t)
 	}
 
 	cwd, err := os.Getwd()
@@ -55,7 +79,43 @@ func runCmd(taskPath string) error {
 		return err
 	}
 
-	workdir := cwd
+	if err := beads.Ensure(root); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: beads unavailable: %v\n", err)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	sem := make(chan struct{}, *parallel)
+	var wg sync.WaitGroup
+	errs := make([]error, len(tasks))
+
+	for i, t := range tasks {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, t *task.Task) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			errs[i] = driveTask(ctx, root, t, *maxIter)
+		}(i, t)
+	}
+	wg.Wait()
+
+	var failed int
+	for i, t := range tasks {
+		if errs[i] != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "saturn: task=%s error: %v\n", t.ID, errs[i])
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d/%d tasks failed", failed, len(tasks))
+	}
+	return nil
+}
+
+func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) error {
+	workdir := root
 	branch := "saturn/" + t.ID
 	if !t.Shared {
 		workdir = filepath.Join(root, ".saturn", "wt", t.ID)
@@ -68,38 +128,64 @@ func runCmd(taskPath string) error {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
+
+	if err := loop.WriteAgentMD(workdir, t.Prompt); err != nil {
+		return err
+	}
+
+	beadID, err := beads.Create(root, t.Title, []string{"saturn", "task:" + t.ID})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] warn: bd create failed: %v\n", t.ID, err)
+	}
+
 	logFile, err := os.Create(filepath.Join(runDir, "events.jsonl"))
 	if err != nil {
 		return err
 	}
 	defer logFile.Close()
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	fmt.Printf("saturn: task=%s workdir=%s\n", t.ID, workdir)
-	events, wait, err := runner.Run(ctx, t, workdir)
-	if err != nil {
-		return err
-	}
-
 	enc := json.NewEncoder(logFile)
-	for ev := range events {
-		_ = enc.Encode(ev)
-		fmt.Printf("[%s] %s%s\n", ev.At.Format(time.RFC3339), ev.Type, suffix(ev.Subtype))
-	}
+	var mu sync.Mutex
 
-	res, err := wait()
-	if err != nil {
-		return err
+	fmt.Printf("[%s] start workdir=%s\n", t.ID, workdir)
+
+	sum, err := loop.Drive(ctx, loop.Options{
+		Task:           t,
+		Workdir:        workdir,
+		RunDir:         runDir,
+		StandingPrompt: assets.StandingPrompt,
+		MaxIterations:  maxIter,
+		BeadID:         beadID,
+		OnEvent: func(iter int, ev runner.Event) {
+			mu.Lock()
+			_ = enc.Encode(ev)
+			mu.Unlock()
+			fmt.Printf("[%s#%d %s] %s%s\n", t.ID, iter, ev.At.Format("15:04:05"), ev.Type, suffix(ev.Subtype))
+		},
+	})
+
+	res := map[string]any{
+		"ended_at":   time.Now().Format(time.RFC3339),
+		"iterations": 0,
 	}
-	b, _ := json.MarshalIndent(map[string]any{
-		"exit_code": res.ExitCode,
-		"ended_at":  time.Now().Format(time.RFC3339),
-	}, "", "  ")
+	if sum != nil {
+		res["iterations"] = len(sum.Iterations)
+		res["stop_reason"] = sum.Reason
+	}
+	if err != nil {
+		res["error"] = err.Error()
+	}
+	b, _ := json.MarshalIndent(res, "", "  ")
 	_ = os.WriteFile(filepath.Join(runDir, "result.json"), b, 0o644)
 
-	fmt.Printf("saturn: done exit=%d events=%d\n", res.ExitCode, len(res.Events))
+	if err != nil {
+		return err
+	}
+	if sum.Reason == loop.StopEmpty {
+		if cerr := beads.Close(root, beadID); cerr != nil {
+			fmt.Fprintf(os.Stderr, "[%s] warn: bd close: %v\n", t.ID, cerr)
+		}
+	}
+	fmt.Printf("[%s] done iterations=%d stop=%s bead=%s\n", t.ID, len(sum.Iterations), sum.Reason, beadID)
 	return nil
 }
 
