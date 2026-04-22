@@ -184,9 +184,13 @@ func (m model) openDiff() (tea.Model, tea.Cmd) {
 	sel := m.runs[m.cursor]
 	branch := "saturn/" + sel.ID
 	if !branchExists(m.repoRoot, branch) {
-		// Shared-mode task: show last 20 commits of current branch.
-		return m, runInPager(m.repoRoot,
-			"git log --oneline -20 && echo '--- diff HEAD~20..HEAD ---' && git diff HEAD~20..HEAD")
+		// Shared-mode task: show last 20 commits with their diffs inline.
+		// `git log -p` handles short histories without needing HEAD~N.
+		return m, runInPager(m.repoRoot, "git log -p --stat -20")
+	}
+	// `main..branch` fails if main doesn't exist; fall back to whole branch.
+	if !branchExists(m.repoRoot, "main") {
+		return m, runInPager(m.repoRoot, fmt.Sprintf("git log -p --stat %s", shellQuote(branch)))
 	}
 	return m, runInPager(m.repoRoot, fmt.Sprintf("git diff main..%s", shellQuote(branch)))
 }
@@ -197,11 +201,17 @@ func (m model) openDiffSummary() (tea.Model, tea.Cmd) {
 		m.flash = "no saturn/* branches yet"
 		return m, nil
 	}
+	mainExists := branchExists(m.repoRoot, "main")
 	var script strings.Builder
 	script.WriteString("echo 'saturn agent diffs · q to quit'; echo; ")
 	for _, b := range branches {
-		script.WriteString(fmt.Sprintf("echo '=== %s ==='; git diff --stat main..%s; echo; ",
-			b, shellQuote(b)))
+		if mainExists {
+			script.WriteString(fmt.Sprintf("echo '=== %s ==='; git diff --stat main..%s; echo; ",
+				b, shellQuote(b)))
+		} else {
+			script.WriteString(fmt.Sprintf("echo '=== %s ==='; git log --oneline %s | head -20; echo; ",
+				b, shellQuote(b)))
+		}
 	}
 	return m, runInPager(m.repoRoot, script.String())
 }
