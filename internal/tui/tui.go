@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andrewn6/saturn/internal/ptty"
 	"github.com/andrewn6/saturn/internal/task"
+	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -26,7 +26,6 @@ const (
 	modeList mode = iota
 	modeNew
 	modeGH
-	modeAttached
 )
 
 type runInfo struct {
@@ -41,7 +40,7 @@ type runInfo struct {
 }
 
 type model struct {
-	root     string // .saturn/runs
+	root     string
 	repoRoot string
 	runs     []runInfo
 	cursor   int
@@ -54,15 +53,9 @@ type model struct {
 	shared bool
 	body   textarea.Model
 	ghRef  textinput.Model
-	focus  int // 0=title/ghRef, 1=shared, 2=body
+	focus  int
 	flash  string
-
-	sessions     map[string]*ptty.Session
-	activeTaskID string
 }
-
-type pttyTickMsg struct{}
-type pttyDoneMsg struct{}
 
 type tickMsg time.Time
 type refreshMsg struct {
@@ -72,7 +65,7 @@ type refreshMsg struct {
 type flashMsg string
 
 func Run(runsRoot string) error {
-	repoRoot := filepath.Dir(filepath.Dir(runsRoot)) // .../<repo>/.saturn/runs -> <repo>
+	repoRoot := filepath.Dir(filepath.Dir(runsRoot))
 	ti := textinput.New()
 	ti.Placeholder = "short task title"
 	ti.CharLimit = 120
@@ -88,7 +81,7 @@ func Run(runsRoot string) error {
 	gh.CharLimit = 120
 	gh.Width = 60
 
-	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh, sessions: map[string]*ptty.Session{}}
+	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -134,74 +127,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateNew(msg)
 	case modeGH:
 		return m.updateGH(msg)
-	case modeAttached:
-		return m.updateAttached(msg)
-	}
-	return m, nil
-}
-
-func pttyTickCmd() tea.Cmd {
-	return tea.Tick(33*time.Millisecond, func(time.Time) tea.Msg { return pttyTickMsg{} })
-}
-
-func (m model) active() *ptty.Session {
-	if m.activeTaskID == "" {
-		return nil
-	}
-	return m.sessions[m.activeTaskID]
-}
-
-func (m model) updateAttached(msg tea.Msg) (tea.Model, tea.Cmd) {
-	sess := m.active()
-	switch msg := msg.(type) {
-	case pttyTickMsg:
-		if sess == nil {
-			m.mode = modeList
-			return m, nil
-		}
-		select {
-		case <-sess.Done():
-			delete(m.sessions, m.activeTaskID)
-			m.activeTaskID = ""
-			m.mode = modeList
-			m.flash = "session ended"
-			return m, refreshCmd(m.root)
-		default:
-		}
-		return m, pttyTickCmd()
-	case tea.WindowSizeMsg:
-		if sess != nil {
-			_ = sess.Resize(msg.Width, msg.Height-1)
-		}
-		return m, nil
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyF12:
-			// Detach — keep child running, return to dashboard.
-			id := m.activeTaskID
-			m.activeTaskID = ""
-			m.mode = modeList
-			m.flash = "detached " + id + " (still running; press o to reattach)"
-			return m, refreshCmd(m.root)
-		case tea.KeyF10:
-			// Hard kill + detach.
-			if sess != nil {
-				_ = sess.Close()
-				delete(m.sessions, m.activeTaskID)
-			}
-			m.activeTaskID = ""
-			m.mode = modeList
-			m.flash = "killed session"
-			return m, refreshCmd(m.root)
-		}
-		if sess == nil {
-			return m, nil
-		}
-		b := ptty.EncodeKey(msg)
-		if len(b) > 0 {
-			_, _ = sess.Write(b)
-		}
-		return m, nil
 	}
 	return m, nil
 }
@@ -242,64 +167,58 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openShell()
 	case "e":
 		return m.openEditor()
+	case "K":
+		return m.killSession()
 	}
 	return m, nil
 }
 
-const taskTemplate = `---
-id: new-task
-shared: false
----
-# Replace with a title
-
-Describe the task here. Either write a free-form prompt, or list work as:
-
-- [ ] step one
-- [ ] step two
-`
-
-func (m model) openEditor() (tea.Model, tea.Cmd) {
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vim"
-	}
-	tmp, err := os.CreateTemp("", "saturn-task-*.md")
-	if err != nil {
-		m.flash = "tempfile: " + err.Error()
+func (m model) openClaude() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
 		return m, nil
 	}
-	tmpPath := tmp.Name()
-	_, _ = tmp.WriteString(taskTemplate)
-	_ = tmp.Close()
-
-	cmd := exec.Command(editor, tmpPath)
-	repoRoot := m.repoRoot
-	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-		defer os.Remove(tmpPath)
+	sel := m.runs[m.cursor]
+	if sel.SessionID == "" {
+		m.flash = "no session id yet (first iteration not complete)"
+		return m, nil
+	}
+	if !tmux.Available() {
+		m.flash = "tmux not installed — install tmux and retry"
+		return m, nil
+	}
+	name := "saturn-" + sel.ID
+	if !tmux.SessionExists(name) {
+		// Shell-quote the session id so special chars survive.
+		shellCmd := fmt.Sprintf("claude --resume %q", sel.SessionID)
+		if err := tmux.NewDetached(name, sel.Workdir, shellCmd); err != nil {
+			m.flash = "tmux create failed: " + err.Error()
+			return m, nil
+		}
+	}
+	return m, tea.ExecProcess(tmux.AttachCmd(name), func(err error) tea.Msg {
 		if err != nil {
-			return flashMsg("editor exited: " + err.Error())
+			return flashMsg("tmux attach: " + err.Error())
 		}
-		contents, rerr := os.ReadFile(tmpPath)
-		if rerr != nil {
-			return flashMsg("read: " + rerr.Error())
-		}
-		if strings.TrimSpace(string(contents)) == strings.TrimSpace(taskTemplate) {
-			return flashMsg("no changes — task not launched")
-		}
-		t, perr := task.ParseFile(tmpPath)
-		if perr != nil {
-			return flashMsg("parse: " + perr.Error())
-		}
-		dest := filepath.Join(repoRoot, "tasks", t.ID+".md")
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return flashMsg("mkdir: " + err.Error())
-		}
-		if err := os.WriteFile(dest, contents, 0o644); err != nil {
-			return flashMsg("write: " + err.Error())
-		}
-		spawnRunArg(repoRoot, dest)
-		return flashMsg("launched " + t.ID)
+		return flashMsg("detached from " + name + " (still running; K to kill)")
 	})
+}
+
+func (m model) killSession() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return m, nil
+	}
+	sel := m.runs[m.cursor]
+	name := "saturn-" + sel.ID
+	if !tmux.SessionExists(name) {
+		m.flash = "no tmux session for " + sel.ID
+		return m, nil
+	}
+	if err := tmux.KillSession(name); err != nil {
+		m.flash = "kill failed: " + err.Error()
+		return m, nil
+	}
+	m.flash = "killed " + name
+	return m, nil
 }
 
 func (m model) openShell() (tea.Model, tea.Cmd) {
@@ -323,46 +242,6 @@ func (m model) openShell() (tea.Model, tea.Cmd) {
 		}
 		return flashMsg("back from " + sel.Workdir)
 	})
-}
-
-func (m model) openClaude() (tea.Model, tea.Cmd) {
-	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
-		return m, nil
-	}
-	sel := m.runs[m.cursor]
-	if sel.SessionID == "" {
-		m.flash = "no session id yet (first iteration not complete)"
-		return m, nil
-	}
-	cols, rows := m.width, m.height-1
-	if cols <= 0 {
-		cols, rows = 120, 40
-	}
-	// Reuse existing live session if present.
-	if existing, ok := m.sessions[sel.ID]; ok {
-		select {
-		case <-existing.Done():
-			delete(m.sessions, sel.ID)
-		default:
-			_ = existing.Resize(cols, rows)
-			m.activeTaskID = sel.ID
-			m.mode = modeAttached
-			m.flash = ""
-			return m, pttyTickCmd()
-		}
-	}
-	cmd := exec.Command("claude", "--resume", sel.SessionID)
-	cmd.Dir = sel.Workdir
-	sess, err := ptty.New(cmd, cols, rows)
-	if err != nil {
-		m.flash = "attach failed: " + err.Error()
-		return m, nil
-	}
-	m.sessions[sel.ID] = sess
-	m.activeTaskID = sel.ID
-	m.mode = modeAttached
-	m.flash = ""
-	return m, pttyTickCmd()
 }
 
 func (m model) updateNew(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -487,9 +366,7 @@ func (m model) submitGH() (tea.Model, tea.Cmd) {
 	return m, refreshCmd(m.root)
 }
 
-func spawnRun(repoRoot, taskPath string) {
-	spawnRunArg(repoRoot, taskPath)
-}
+func spawnRun(repoRoot, taskPath string) { spawnRunArg(repoRoot, taskPath) }
 
 func spawnRunArg(repoRoot, arg string) {
 	exe, err := os.Executable()
@@ -507,6 +384,62 @@ func spawnRunArg(repoRoot, arg string) {
 	_ = cmd.Start()
 	go cmd.Wait()
 }
+
+func (m model) openEditor() (tea.Model, tea.Cmd) {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim"
+	}
+	tmp, err := os.CreateTemp("", "saturn-task-*.md")
+	if err != nil {
+		m.flash = "tempfile: " + err.Error()
+		return m, nil
+	}
+	tmpPath := tmp.Name()
+	_, _ = tmp.WriteString(taskTemplate)
+	_ = tmp.Close()
+
+	cmd := exec.Command(editor, tmpPath)
+	repoRoot := m.repoRoot
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(tmpPath)
+		if err != nil {
+			return flashMsg("editor exited: " + err.Error())
+		}
+		contents, rerr := os.ReadFile(tmpPath)
+		if rerr != nil {
+			return flashMsg("read: " + rerr.Error())
+		}
+		if strings.TrimSpace(string(contents)) == strings.TrimSpace(taskTemplate) {
+			return flashMsg("no changes — task not launched")
+		}
+		t, perr := task.ParseFile(tmpPath)
+		if perr != nil {
+			return flashMsg("parse: " + perr.Error())
+		}
+		dest := filepath.Join(repoRoot, "tasks", t.ID+".md")
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return flashMsg("mkdir: " + err.Error())
+		}
+		if err := os.WriteFile(dest, contents, 0o644); err != nil {
+			return flashMsg("write: " + err.Error())
+		}
+		spawnRunArg(repoRoot, dest)
+		return flashMsg("launched " + t.ID)
+	})
+}
+
+const taskTemplate = `---
+id: new-task
+shared: false
+---
+# Replace with a title
+
+Describe the task here. Either write a free-form prompt, or list work as:
+
+- [ ] step one
+- [ ] step two
+`
 
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
@@ -526,20 +459,8 @@ func (m model) View() string {
 		return m.viewNew()
 	case modeGH:
 		return m.viewGH()
-	case modeAttached:
-		return m.viewAttached()
 	}
 	return m.viewList()
-}
-
-func (m model) viewAttached() string {
-	sess := m.active()
-	if sess == nil {
-		return "no session"
-	}
-	screen := sess.Render()
-	footer := dim.Render("[attached " + m.activeTaskID + " · F12 detach · F10 kill]")
-	return screen + "\n" + footer
 }
 
 func (m model) viewList() string {
@@ -561,7 +482,7 @@ func (m model) viewList() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o open · w shell · r refresh · q quit", len(m.runs))) + "\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o attach · w shell · K kill-tmux · r refresh · q quit", len(m.runs))) + "\n")
 	if m.flash != "" {
 		lb.WriteString(okBadge.Render(m.flash) + "\n")
 	}
@@ -585,6 +506,9 @@ func (m model) viewList() string {
 		rb.WriteString(titleStyle.Render(sel.ID) + "\n")
 		rb.WriteString(dim.Render(fmt.Sprintf("workdir=%s", sel.Workdir)) + "\n")
 		rb.WriteString(dim.Render(fmt.Sprintf("stop=%s ended=%s", sel.StopReason, sel.EndedAt)) + "\n")
+		if tmux.SessionExists("saturn-" + sel.ID) {
+			rb.WriteString(runBadge.Render("tmux session live — press o to attach") + "\n")
+		}
 		if sel.Error != "" {
 			rb.WriteString(errBadge.Render("error: "+sel.Error) + "\n")
 		}
@@ -703,11 +627,13 @@ func loadRun(dir string) (runInfo, error) {
 		r.Error = res.Error
 	}
 	r.TailLines = tailEvents(filepath.Join(dir, "events.jsonl"), 40)
-	r.SessionID = firstSessionID(filepath.Join(dir, "events.jsonl"))
+	r.SessionID = latestSessionID(filepath.Join(dir, "events.jsonl"))
 	return r, nil
 }
 
-func firstSessionID(path string) string {
+// latestSessionID walks the events.jsonl and returns the session_id from the
+// most recent system/init event (each iteration typically starts a new one).
+func latestSessionID(path string) string {
 	f, err := os.Open(path)
 	if err != nil {
 		return ""
@@ -715,6 +641,7 @@ func firstSessionID(path string) string {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+	var latest string
 	for sc.Scan() {
 		var ev struct {
 			Raw struct {
@@ -727,10 +654,10 @@ func firstSessionID(path string) string {
 			continue
 		}
 		if ev.Raw.Type == "system" && ev.Raw.Subtype == "init" && ev.Raw.SessionID != "" {
-			return ev.Raw.SessionID
+			latest = ev.Raw.SessionID
 		}
 	}
-	return ""
+	return latest
 }
 
 func tailEvents(path string, n int) []string {
