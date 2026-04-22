@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/task"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -163,8 +164,66 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openClaude()
 	case "w":
 		return m.openShell()
+	case "e":
+		return m.openEditor()
 	}
 	return m, nil
+}
+
+const taskTemplate = `---
+id: new-task
+shared: false
+---
+# Replace with a title
+
+Describe the task here. Either write a free-form prompt, or list work as:
+
+- [ ] step one
+- [ ] step two
+`
+
+func (m model) openEditor() (tea.Model, tea.Cmd) {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vim"
+	}
+	tmp, err := os.CreateTemp("", "saturn-task-*.md")
+	if err != nil {
+		m.flash = "tempfile: " + err.Error()
+		return m, nil
+	}
+	tmpPath := tmp.Name()
+	_, _ = tmp.WriteString(taskTemplate)
+	_ = tmp.Close()
+
+	cmd := exec.Command(editor, tmpPath)
+	repoRoot := m.repoRoot
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		defer os.Remove(tmpPath)
+		if err != nil {
+			return flashMsg("editor exited: " + err.Error())
+		}
+		contents, rerr := os.ReadFile(tmpPath)
+		if rerr != nil {
+			return flashMsg("read: " + rerr.Error())
+		}
+		if strings.TrimSpace(string(contents)) == strings.TrimSpace(taskTemplate) {
+			return flashMsg("no changes — task not launched")
+		}
+		t, perr := task.ParseFile(tmpPath)
+		if perr != nil {
+			return flashMsg("parse: " + perr.Error())
+		}
+		dest := filepath.Join(repoRoot, "tasks", t.ID+".md")
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return flashMsg("mkdir: " + err.Error())
+		}
+		if err := os.WriteFile(dest, contents, 0o644); err != nil {
+			return flashMsg("write: " + err.Error())
+		}
+		spawnRunArg(repoRoot, dest)
+		return flashMsg("launched " + t.ID)
+	})
 }
 
 func (m model) openShell() (tea.Model, tea.Cmd) {
@@ -393,13 +452,13 @@ func (m model) viewList() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g gh · o open · w shell · r refresh · q quit", len(m.runs))) + "\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o open · w shell · r refresh · q quit", len(m.runs))) + "\n")
 	if m.flash != "" {
 		lb.WriteString(okBadge.Render(m.flash) + "\n")
 	}
 	lb.WriteString("\n")
 	if len(m.runs) == 0 {
-		lb.WriteString(dim.Render("no runs yet") + "\n")
+		lb.WriteString(dim.Render("no runs yet — press e to write a task in $EDITOR") + "\n")
 	}
 	for i, r := range m.runs {
 		line := fmt.Sprintf("%s %-20s %s", badge(r), truncate(r.ID, 20), dim.Render(fmt.Sprintf("iter=%d", r.Iterations)))
