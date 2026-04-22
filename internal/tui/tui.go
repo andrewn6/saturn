@@ -161,8 +161,33 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 	case "o":
 		return m.openClaude()
+	case "w":
+		return m.openShell()
 	}
 	return m, nil
+}
+
+func (m model) openShell() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return m, nil
+	}
+	sel := m.runs[m.cursor]
+	if sel.Workdir == "" {
+		m.flash = "no workdir for this run"
+		return m, nil
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	cmd := exec.Command(shell)
+	cmd.Dir = sel.Workdir
+	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return flashMsg("shell exited: " + err.Error())
+		}
+		return flashMsg("back from " + sel.Workdir)
+	})
 }
 
 func (m model) openClaude() (tea.Model, tea.Cmd) {
@@ -368,7 +393,7 @@ func (m model) viewList() string {
 
 	var lb strings.Builder
 	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g github · o open · r refresh · q quit", len(m.runs))) + "\n")
+	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · n new · g gh · o open · w shell · r refresh · q quit", len(m.runs))) + "\n")
 	if m.flash != "" {
 		lb.WriteString(okBadge.Render(m.flash) + "\n")
 	}
@@ -390,6 +415,7 @@ func (m model) viewList() string {
 	if len(m.runs) > 0 && m.cursor < len(m.runs) {
 		sel := m.runs[m.cursor]
 		rb.WriteString(titleStyle.Render(sel.ID) + "\n")
+		rb.WriteString(dim.Render(fmt.Sprintf("workdir=%s", sel.Workdir)) + "\n")
 		rb.WriteString(dim.Render(fmt.Sprintf("stop=%s ended=%s", sel.StopReason, sel.EndedAt)) + "\n")
 		if sel.Error != "" {
 			rb.WriteString(errBadge.Render("error: "+sel.Error) + "\n")

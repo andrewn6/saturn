@@ -90,6 +90,14 @@ func runCmd(args []string) error {
 		tasks = append(tasks, t)
 	}
 
+	if len(tasks) > 1 {
+		for _, t := range tasks {
+			if t.Shared {
+				return fmt.Errorf("task %q has shared:true — shared mode is only supported for single-task runs (multiple agents would collide on AGENT.md and file edits); remove shared:true to use worktrees", t.ID)
+			}
+		}
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err

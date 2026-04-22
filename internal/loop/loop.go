@@ -76,7 +76,10 @@ func Drive(ctx context.Context, opts Options) (*Summary, error) {
 			sum.Reason = StopSentinel
 			return sum, nil
 		}
-		if !hasUnchecked(opts.Workdir) {
+		// Only treat "no unchecked items" as a stop condition AFTER at least
+		// one iteration has run — whole-body (checklist-less) tasks must run
+		// at least once before they can finish.
+		if iter > 0 && !hasUnchecked(opts.Workdir) {
 			sum.Reason = StopEmpty
 			return sum, nil
 		}
