@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -184,15 +185,52 @@ func (m model) openDiff() (tea.Model, tea.Cmd) {
 	sel := m.runs[m.cursor]
 	branch := "saturn/" + sel.ID
 	if !branchExists(m.repoRoot, branch) {
-		// Shared-mode task: show last 20 commits with their diffs inline.
-		// `git log -p` handles short histories without needing HEAD~N.
-		return m, runInPager(m.repoRoot, "git log -p --stat -20")
+		script := fmt.Sprintf("%s && git -c color.ui=always log -p --stat -20",
+			styledHeader(sel.ID, "(shared mode — last 20 commits)"))
+		return m, runInPager(m.repoRoot, script)
 	}
-	// `main..branch` fails if main doesn't exist; fall back to whole branch.
 	if !branchExists(m.repoRoot, "main") {
-		return m, runInPager(m.repoRoot, fmt.Sprintf("git log -p --stat %s", shellQuote(branch)))
+		script := fmt.Sprintf("%s && %s",
+			styledHeader(sel.ID, "(no main branch — full branch log)"),
+			diffCmdForBranchOnly(branch))
+		return m, runInPager(m.repoRoot, script)
 	}
-	return m, runInPager(m.repoRoot, fmt.Sprintf("git diff main..%s", shellQuote(branch)))
+	stats := shortStat(m.repoRoot, "main", branch)
+	script := fmt.Sprintf("%s && %s",
+		styledHeader(sel.ID, stats),
+		diffCmdFor("main", branch))
+	return m, runInPager(m.repoRoot, script)
+}
+
+// styledHeader emits a shell `printf` that prints a magenta bar + agent name
+// + stats. Works in any ANSI-respecting pager (less -R).
+func styledHeader(agent, stats string) string {
+	line := fmt.Sprintf("\x1b[1;35m▎ %s\x1b[0m  \x1b[0;90m%s\x1b[0m\n\n", agent, stats)
+	return "printf '%b' " + shellQuote(line)
+}
+
+// diffCmdFor prefers `delta` when available; otherwise forces git colors.
+func diffCmdFor(base, branch string) string {
+	if _, err := exec.LookPath("delta"); err == nil {
+		return fmt.Sprintf("git diff %s..%s | delta", shellQuote(base), shellQuote(branch))
+	}
+	return fmt.Sprintf("git -c color.ui=always diff %s..%s", shellQuote(base), shellQuote(branch))
+}
+
+func diffCmdForBranchOnly(branch string) string {
+	if _, err := exec.LookPath("delta"); err == nil {
+		return fmt.Sprintf("git log -p %s | delta", shellQuote(branch))
+	}
+	return fmt.Sprintf("git -c color.ui=always log -p --stat %s", shellQuote(branch))
+}
+
+func shortStat(repoRoot, base, branch string) string {
+	cmd := exec.Command("git", "-C", repoRoot, "diff", "--shortstat", base+".."+branch)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func (m model) openDiffSummary() (tea.Model, tea.Cmd) {
@@ -202,18 +240,77 @@ func (m model) openDiffSummary() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	mainExists := branchExists(m.repoRoot, "main")
-	var script strings.Builder
-	script.WriteString("echo 'saturn agent diffs · q to quit'; echo; ")
-	for _, b := range branches {
-		if mainExists {
-			script.WriteString(fmt.Sprintf("echo '=== %s ==='; git diff --stat main..%s; echo; ",
-				b, shellQuote(b)))
-		} else {
-			script.WriteString(fmt.Sprintf("echo '=== %s ==='; git log --oneline %s | head -20; echo; ",
-				b, shellQuote(b)))
+	content := buildDiffSummary(m.repoRoot, branches, mainExists)
+	// Pass the pre-built content through the pager via printf so ANSI survives.
+	return m, runInPager(m.repoRoot, "printf '%b' "+shellQuote(content))
+}
+
+// buildDiffSummary renders an ANSI-colored per-agent diff table:
+//
+//	▎ saturn/login-fix                    3 files  +24 -3
+//	  src/auth.py                                  +24 -3
+//	  src/tests/auth_test.py                       +10 -0
+//
+// Colors: magenta agent names, green adds, red dels, dim file paths.
+func buildDiffSummary(repoRoot string, branches []string, mainExists bool) string {
+	var b strings.Builder
+	b.WriteString("\x1b[1msaturn — all agent diffs\x1b[0m  \x1b[0;90m(q to quit)\x1b[0m\n\n")
+
+	for _, br := range branches {
+		if !mainExists {
+			b.WriteString(fmt.Sprintf("\x1b[1;35m▎ %s\x1b[0m  \x1b[0;90m(no main — see log)\x1b[0m\n\n", br))
+			continue
 		}
+		rows, totalAdd, totalDel := numstat(repoRoot, "main", br)
+		fileCount := len(rows)
+		b.WriteString(fmt.Sprintf("\x1b[1;35m▎ %s\x1b[0m  \x1b[0;90m%d file%s\x1b[0m  \x1b[32m+%d\x1b[0m \x1b[31m-%d\x1b[0m\n",
+			br, fileCount, plural(fileCount), totalAdd, totalDel))
+		if fileCount == 0 {
+			b.WriteString("  \x1b[0;90m(no changes yet)\x1b[0m\n\n")
+			continue
+		}
+		for _, r := range rows {
+			b.WriteString(fmt.Sprintf("  \x1b[0;37m%-50s\x1b[0m  \x1b[32m+%-4d\x1b[0m \x1b[31m-%d\x1b[0m\n",
+				truncate(r.Path, 50), r.Added, r.Deleted))
+		}
+		b.WriteString("\n")
 	}
-	return m, runInPager(m.repoRoot, script.String())
+	return b.String()
+}
+
+type numstatRow struct {
+	Added, Deleted int
+	Path           string
+}
+
+func numstat(repoRoot, base, branch string) (rows []numstatRow, totalAdd, totalDel int) {
+	cmd := exec.Command("git", "-C", repoRoot, "diff", "--numstat", base+".."+branch)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, 0, 0
+	}
+	for _, ln := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if ln == "" {
+			continue
+		}
+		parts := strings.SplitN(ln, "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		a, _ := strconv.Atoi(parts[0])
+		d, _ := strconv.Atoi(parts[1])
+		rows = append(rows, numstatRow{Added: a, Deleted: d, Path: parts[2]})
+		totalAdd += a
+		totalDel += d
+	}
+	return rows, totalAdd, totalDel
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func branchExists(repoRoot, name string) bool {
