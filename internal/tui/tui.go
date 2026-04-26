@@ -27,7 +27,17 @@ const (
 	modeList mode = iota
 	modeNew
 	modeGH
+	modeDiffSummary
+	modeDiffView
 )
+
+type diffEntry struct {
+	Branch  string
+	Files   []numstatRow
+	Added   int
+	Deleted int
+	NoMain  bool
+}
 
 type runInfo struct {
 	ID         string
@@ -56,6 +66,11 @@ type model struct {
 	ghRef  textinput.Model
 	focus  int
 	flash  string
+
+	diffEntries []diffEntry
+	diffCursor  int
+
+	diff diffViewState
 }
 
 type tickMsg time.Time
@@ -128,6 +143,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateNew(msg)
 	case modeGH:
 		return m.updateGH(msg)
+	case modeDiffSummary:
+		return m.updateDiffSummary(msg)
+	case modeDiffView:
+		return m.updateDiffView(msg)
 	}
 	return m, nil
 }
@@ -173,7 +192,7 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "d":
 		return m.openDiff()
 	case "D":
-		return m.openDiffSummary()
+		return m.enterDiffSummary()
 	}
 	return m, nil
 }
@@ -185,21 +204,10 @@ func (m model) openDiff() (tea.Model, tea.Cmd) {
 	sel := m.runs[m.cursor]
 	branch := "saturn/" + sel.ID
 	if !branchExists(m.repoRoot, branch) {
-		script := fmt.Sprintf("%s && git -c color.ui=always log -p --stat -20",
-			styledHeader(sel.ID, "(shared mode — last 20 commits)"))
-		return m, runInPager(m.repoRoot, script)
+		m.flash = "no branch saturn/" + sel.ID + " (shared mode? press w to shell in)"
+		return m, nil
 	}
-	if !branchExists(m.repoRoot, "main") {
-		script := fmt.Sprintf("%s && %s",
-			styledHeader(sel.ID, "(no main branch — full branch log)"),
-			diffCmdForBranchOnly(branch))
-		return m, runInPager(m.repoRoot, script)
-	}
-	stats := shortStat(m.repoRoot, "main", branch)
-	script := fmt.Sprintf("%s && %s",
-		styledHeader(sel.ID, stats),
-		diffCmdFor("main", branch))
-	return m, runInPager(m.repoRoot, script)
+	return m.enterDiffView(branch, modeList)
 }
 
 // styledHeader emits a shell `printf` that prints a magenta bar + agent name
@@ -233,16 +241,62 @@ func shortStat(repoRoot, base, branch string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func (m model) openDiffSummary() (tea.Model, tea.Cmd) {
+func (m model) enterDiffSummary() (tea.Model, tea.Cmd) {
 	branches := saturnBranches(m.repoRoot)
 	if len(branches) == 0 {
 		m.flash = "no saturn/* branches yet"
 		return m, nil
 	}
 	mainExists := branchExists(m.repoRoot, "main")
-	content := buildDiffSummary(m.repoRoot, branches, mainExists)
-	// Pass the pre-built content through the pager via printf so ANSI survives.
-	return m, runInPager(m.repoRoot, "printf '%b' "+shellQuote(content))
+	entries := make([]diffEntry, 0, len(branches))
+	for _, br := range branches {
+		e := diffEntry{Branch: br, NoMain: !mainExists}
+		if mainExists {
+			files, add, del := numstat(m.repoRoot, "main", br)
+			e.Files = files
+			e.Added = add
+			e.Deleted = del
+		}
+		entries = append(entries, e)
+	}
+	m.diffEntries = entries
+	m.diffCursor = 0
+	m.mode = modeDiffSummary
+	m.flash = ""
+	return m, nil
+}
+
+func (m model) updateDiffSummary(msg tea.Msg) (tea.Model, tea.Cmd) {
+	km, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch km.String() {
+	case "q", "esc":
+		m.mode = modeList
+		return m, nil
+	case "j", "down":
+		if m.diffCursor < len(m.diffEntries)-1 {
+			m.diffCursor++
+		}
+	case "k", "up":
+		if m.diffCursor > 0 {
+			m.diffCursor--
+		}
+	case "r":
+		return m.enterDiffSummary()
+	case "enter":
+		if len(m.diffEntries) == 0 {
+			return m, nil
+		}
+		entry := m.diffEntries[m.diffCursor]
+		if entry.NoMain {
+			m.flash = "no main branch — diff view unavailable"
+			return m, nil
+		}
+		return m.enterDiffView(entry.Branch, modeDiffSummary)
+	}
+	return m, nil
 }
 
 // buildDiffSummary renders an ANSI-colored per-agent diff table:
@@ -641,6 +695,10 @@ func (m model) View() string {
 		return m.viewNew()
 	case modeGH:
 		return m.viewGH()
+	case modeDiffSummary:
+		return m.viewDiffSummary()
+	case modeDiffView:
+		return m.viewDiffView()
 	}
 	return m.viewList()
 }
