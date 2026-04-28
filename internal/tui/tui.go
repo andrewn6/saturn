@@ -435,7 +435,7 @@ func (m model) openClaude() (tea.Model, tea.Cmd) {
 		if err != nil {
 			return flashMsg("tmux attach: " + err.Error())
 		}
-		return flashMsg("detached " + name + " — F12 detach · F10 kill (still running; K here to kill)")
+		return flashMsg("detached " + name + " — Ctrl+\\ detach · Ctrl+] kill (still running; K here to kill)")
 	})
 }
 

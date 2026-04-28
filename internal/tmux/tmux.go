@@ -17,9 +17,10 @@ import (
 // keybinds (F12=detach, F10=kill) don't pollute the user's normal tmux.
 const socket = "saturn"
 
-const tmuxConfig = `# Saturn tmux config — single-key detach/kill (no prefix)
-bind-key -n F12 detach-client
-bind-key -n F10 kill-session
+const tmuxConfig = `# Saturn tmux config — single-chord detach/kill (no prefix)
+# Ctrl+\ detaches (returns to Saturn), Ctrl+] kills the session.
+bind-key -n C-\ detach-client
+bind-key -n C-] kill-session
 set -g status off
 set -g mouse on
 `
