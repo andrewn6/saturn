@@ -19,7 +19,7 @@ const socket = "saturn"
 
 const tmuxConfig = `# Saturn tmux config — single-chord detach/kill (no prefix)
 # Ctrl+\ detaches (returns to Saturn), Ctrl+] kills the session.
-bind-key -n C-\ detach-client
+bind-key -n 'C-\' detach-client
 bind-key -n C-] kill-session
 set -g status off
 set -g mouse on
