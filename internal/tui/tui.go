@@ -858,19 +858,128 @@ func tailEvents(path string, n int) []string {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	for sc.Scan() {
-		var ev struct {
-			At      time.Time `json:"at"`
-			Type    string    `json:"type"`
-			Subtype string    `json:"subtype"`
-		}
-		_ = json.Unmarshal(sc.Bytes(), &ev)
-		line := fmt.Sprintf("%s %s%s", ev.At.Format("15:04:05"), ev.Type, suffix(ev.Subtype))
-		ring = append(ring, line)
-		if len(ring) > n {
-			ring = ring[1:]
+		for _, ln := range summarizeEvent(sc.Bytes()) {
+			ring = append(ring, ln)
+			if len(ring) > n {
+				ring = ring[1:]
+			}
 		}
 	}
 	return ring
+}
+
+// summarizeEvent turns one stream-json line into 0..N readable summary lines.
+func summarizeEvent(raw []byte) []string {
+	var ev struct {
+		At  time.Time       `json:"at"`
+		Raw json.RawMessage `json:"raw"`
+	}
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil
+	}
+	var inner struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		Message struct {
+			Role    string            `json:"role"`
+			Content []json.RawMessage `json:"content"`
+		} `json:"message"`
+		Result     string  `json:"result"`
+		DurationMs int64   `json:"duration_ms"`
+		TotalCost  float64 `json:"total_cost_usd"`
+		IsError    bool    `json:"is_error"`
+	}
+	_ = json.Unmarshal(ev.Raw, &inner)
+
+	ts := ev.At.Format("15:04:05")
+	switch inner.Type {
+	case "system":
+		if inner.Subtype == "init" {
+			return []string{ts + " ● session started"}
+		}
+		return nil
+	case "assistant":
+		var out []string
+		for _, c := range inner.Message.Content {
+			if line := summarizeContent(ts, c); line != "" {
+				out = append(out, line)
+			}
+		}
+		return out
+	case "user":
+		return nil
+	case "result":
+		dur := time.Duration(inner.DurationMs) * time.Millisecond
+		mark := "✓"
+		if inner.IsError {
+			mark = "✗"
+		}
+		return []string{fmt.Sprintf("%s %s done · %s · $%.4f",
+			ts, mark, formatDuration(dur.Truncate(time.Second)), inner.TotalCost)}
+	}
+	return nil
+}
+
+func summarizeContent(ts string, raw json.RawMessage) string {
+	var c struct {
+		Type  string                 `json:"type"`
+		Text  string                 `json:"text"`
+		Name  string                 `json:"name"`
+		Input map[string]interface{} `json:"input"`
+	}
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return ""
+	}
+	switch c.Type {
+	case "text":
+		t := strings.TrimSpace(c.Text)
+		if t == "" {
+			return ""
+		}
+		if i := strings.Index(t, "\n"); i > 0 {
+			t = t[:i]
+		}
+		if len(t) > 80 {
+			t = t[:80] + "…"
+		}
+		return ts + " ▸ " + t
+	case "tool_use":
+		return ts + " → " + c.Name + "(" + summarizeToolArg(c.Name, c.Input) + ")"
+	}
+	return ""
+}
+
+func summarizeToolArg(name string, in map[string]interface{}) string {
+	if in == nil {
+		return ""
+	}
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := in[k]; ok {
+				if s, ok := v.(string); ok {
+					if len(s) > 60 {
+						return s[:60] + "…"
+					}
+					return s
+				}
+			}
+		}
+		return ""
+	}
+	switch name {
+	case "Bash":
+		return pick("command")
+	case "Read", "Edit", "Write", "MultiEdit", "NotebookEdit":
+		return pick("file_path", "path")
+	case "Grep", "Glob":
+		return pick("pattern")
+	case "Task":
+		return pick("description", "subagent_type")
+	case "WebFetch", "WebSearch":
+		return pick("url", "query")
+	default:
+		return pick("file_path", "path", "command", "pattern", "query", "url")
+	}
 }
 
 func suffix(s string) string {
