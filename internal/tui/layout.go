@@ -256,6 +256,9 @@ func runCost(repoRoot string, r runInfo) float64 {
 			Raw struct {
 				Type string  `json:"type"`
 				Cost float64 `json:"total_cost_usd"`
+				Part struct {
+					Cost float64 `json:"cost"`
+				} `json:"part"`
 			} `json:"raw"`
 		}
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
@@ -263,6 +266,9 @@ func runCost(repoRoot string, r runInfo) float64 {
 		}
 		if ev.Raw.Type == "result" && ev.Raw.Cost > 0 {
 			total += ev.Raw.Cost
+		}
+		if ev.Raw.Type == "step_finish" && ev.Raw.Part.Cost > 0 {
+			total += ev.Raw.Part.Cost
 		}
 	}
 	return total
@@ -352,12 +358,19 @@ func hourlyCosts(repoRoot string, runs []runInfo, hours int) []float64 {
 				Raw struct {
 					Type string  `json:"type"`
 					Cost float64 `json:"total_cost_usd"`
+					Part struct {
+						Cost float64 `json:"cost"`
+					} `json:"part"`
 				} `json:"raw"`
 			}
 			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 				continue
 			}
-			if ev.Raw.Type != "result" || ev.Raw.Cost <= 0 {
+			cost := ev.Raw.Cost
+			if cost == 0 {
+				cost = ev.Raw.Part.Cost
+			}
+			if cost <= 0 {
 				continue
 			}
 			if ev.At.Before(cutoff) {
@@ -367,7 +380,7 @@ func hourlyCosts(repoRoot string, runs []runInfo, hours int) []float64 {
 			if idx < 0 || idx >= hours {
 				continue
 			}
-			buckets[idx] += ev.Raw.Cost
+			buckets[idx] += cost
 		}
 		f.Close()
 	}

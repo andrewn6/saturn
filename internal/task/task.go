@@ -17,11 +17,12 @@ const (
 )
 
 type Task struct {
-	ID     string
-	Title  string
-	Prompt string
-	Source Source
-	Shared bool
+	ID      string
+	Title   string
+	Prompt  string
+	Source  Source
+	Shared  bool
+	Backend string // "" = auto, "claude", "opencode"
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -82,6 +83,8 @@ func ParseFile(path string) (*Task, error) {
 				t.Title = v
 			case "shared":
 				t.Shared = v == "true"
+			case "backend":
+				t.Backend = v
 			}
 			continue
 		}

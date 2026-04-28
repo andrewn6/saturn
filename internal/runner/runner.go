@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/agent"
 	"github.com/andrewn6/saturn/internal/task"
 )
 
@@ -31,12 +32,12 @@ type Result struct {
 // closes when the subprocess exits. Call the returned wait func to collect
 // the exit code and the full event slice.
 func Run(ctx context.Context, t *task.Task, workdir string) (<-chan Event, func() (*Result, error), error) {
-	args := []string{
-		"-p", t.Prompt,
-		"--output-format", "stream-json",
-		"--verbose",
+	cmd, err := agent.SpawnCmd(t.Backend, t.Prompt, workdir)
+	if err != nil {
+		return nil, nil, err
 	}
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	// Re-bind to ctx so cancel kills the child.
+	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 	cmd.Dir = workdir
 
 	stdout, err := cmd.StdoutPipe()

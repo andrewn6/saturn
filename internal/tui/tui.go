@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/agent"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -48,6 +49,7 @@ type runInfo struct {
 	TailLines  []string
 	SessionID  string
 	Workdir    string
+	Backend    string
 }
 
 type model struct {
@@ -425,7 +427,8 @@ func (m model) openClaude() (tea.Model, tea.Cmd) {
 	name := "saturn-" + sel.ID
 	if !tmux.SessionExists(name) {
 		// Shell-quote the session id so special chars survive.
-		shellCmd := fmt.Sprintf("claude --resume %q", sel.SessionID)
+		attach := agent.AttachCmd(sel.Backend, sel.SessionID)
+		shellCmd := strings.Join(append([]string{attach.Path}, attach.Args[1:]...), " ")
 		if err := tmux.NewDetached(name, sel.Workdir, shellCmd); err != nil {
 			m.flash = "tmux create failed: " + err.Error()
 			return m, nil
@@ -807,12 +810,14 @@ func loadRun(dir string) (runInfo, error) {
 			Iterations int    `json:"iterations"`
 			StopReason string `json:"stop_reason"`
 			Error      string `json:"error"`
+			Backend    string `json:"backend"`
 		}
 		_ = json.Unmarshal(b, &res)
 		r.EndedAt = res.EndedAt
 		r.Iterations = res.Iterations
 		r.StopReason = res.StopReason
 		r.Error = res.Error
+		r.Backend = res.Backend
 	}
 	r.TailLines = tailEvents(filepath.Join(dir, "events.jsonl"), 40)
 	r.SessionID = latestSessionID(filepath.Join(dir, "events.jsonl"))
@@ -833,9 +838,10 @@ func latestSessionID(path string) string {
 	for sc.Scan() {
 		var ev struct {
 			Raw struct {
-				Type      string `json:"type"`
-				Subtype   string `json:"subtype"`
-				SessionID string `json:"session_id"`
+				Type        string `json:"type"`
+				Subtype     string `json:"subtype"`
+				SessionID   string `json:"session_id"`
+				SessionIDOC string `json:"sessionID"`
 			} `json:"raw"`
 		}
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
@@ -843,6 +849,10 @@ func latestSessionID(path string) string {
 		}
 		if ev.Raw.Type == "system" && ev.Raw.Subtype == "init" && ev.Raw.SessionID != "" {
 			latest = ev.Raw.SessionID
+		}
+		// Opencode: every event carries sessionID; capture from step_start.
+		if ev.Raw.Type == "step_start" && ev.Raw.SessionIDOC != "" {
+			latest = ev.Raw.SessionIDOC
 		}
 	}
 	return latest
@@ -892,6 +902,47 @@ func summarizeEvent(raw []byte) []string {
 	_ = json.Unmarshal(ev.Raw, &inner)
 
 	ts := ev.At.Format("15:04:05")
+	// Opencode event shapes (step_start / text / step_finish / tool).
+	switch inner.Type {
+	case "step_start":
+		return []string{ts + " ● session started"}
+	case "text":
+		// opencode text part
+		var part struct {
+			Part struct {
+				Text string `json:"text"`
+			} `json:"part"`
+		}
+		_ = json.Unmarshal(ev.Raw, &part)
+		t := strings.TrimSpace(part.Part.Text)
+		if t == "" {
+			return nil
+		}
+		if i := strings.Index(t, "\n"); i > 0 {
+			t = t[:i]
+		}
+		if len(t) > 80 {
+			t = t[:80] + "…"
+		}
+		return []string{ts + " ▸ " + t}
+	case "tool":
+		var part struct {
+			Part struct {
+				Name  string                 `json:"name"`
+				Input map[string]interface{} `json:"input"`
+			} `json:"part"`
+		}
+		_ = json.Unmarshal(ev.Raw, &part)
+		return []string{ts + " → " + part.Part.Name + "(" + summarizeToolArg(part.Part.Name, part.Part.Input) + ")"}
+	case "step_finish":
+		var part struct {
+			Part struct {
+				Cost float64 `json:"cost"`
+			} `json:"part"`
+		}
+		_ = json.Unmarshal(ev.Raw, &part)
+		return []string{fmt.Sprintf("%s ✓ done · $%.4f", ts, part.Part.Cost)}
+	}
 	switch inner.Type {
 	case "system":
 		if inner.Subtype == "init" {

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/agent"
 	"github.com/andrewn6/saturn/internal/assets"
 	"github.com/andrewn6/saturn/internal/beads"
 	"github.com/andrewn6/saturn/internal/loop"
@@ -194,6 +195,7 @@ func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) erro
 	res := map[string]any{
 		"ended_at":   time.Now().Format(time.RFC3339),
 		"iterations": 0,
+		"backend":    agent.Resolve(t.Backend),
 	}
 	if sum != nil {
 		res["iterations"] = len(sum.Iterations)
