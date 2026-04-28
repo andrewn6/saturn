@@ -107,7 +107,7 @@ func (m model) Init() tea.Cmd {
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func refreshCmd(root string) tea.Cmd {
@@ -707,59 +707,7 @@ func (m model) viewList() string {
 	if m.err != nil {
 		return fmt.Sprintf("error: %v (press q to quit)", m.err)
 	}
-	w, h := m.width, m.height
-	if w == 0 {
-		w, h = 100, 30
-	}
-	left := w / 3
-	if left < 30 {
-		left = 30
-	}
-	right := w - left - 3
-	if right < 20 {
-		right = 20
-	}
-
-	var lb strings.Builder
-	lb.WriteString(titleStyle.Render("saturn watch") + "\n")
-	lb.WriteString(dim.Render(fmt.Sprintf("%d runs · e editor · n quick · g gh · o attach · w shell · d diff · D all-diffs · K kill · r refresh · q quit", len(m.runs))) + "\n")
-	if m.flash != "" {
-		lb.WriteString(okBadge.Render(m.flash) + "\n")
-	}
-	lb.WriteString("\n")
-	if len(m.runs) == 0 {
-		lb.WriteString(dim.Render("no runs yet — press e to write a task in $EDITOR") + "\n")
-	}
-	for i, r := range m.runs {
-		line := fmt.Sprintf("%s %-20s %s", badge(r), truncate(r.ID, 20), dim.Render(fmt.Sprintf("iter=%d", r.Iterations)))
-		if i == m.cursor {
-			line = rowSel.Render(line)
-		} else {
-			line = rowNormal.Render(line)
-		}
-		lb.WriteString(line + "\n")
-	}
-
-	var rb strings.Builder
-	if len(m.runs) > 0 && m.cursor < len(m.runs) {
-		sel := m.runs[m.cursor]
-		rb.WriteString(titleStyle.Render(sel.ID) + "\n")
-		rb.WriteString(dim.Render(fmt.Sprintf("workdir=%s", sel.Workdir)) + "\n")
-		rb.WriteString(dim.Render(fmt.Sprintf("stop=%s ended=%s", sel.StopReason, sel.EndedAt)) + "\n")
-		if tmux.SessionExists("saturn-" + sel.ID) {
-			rb.WriteString(runBadge.Render("tmux session live — press o to attach") + "\n")
-		}
-		if sel.Error != "" {
-			rb.WriteString(errBadge.Render("error: "+sel.Error) + "\n")
-		}
-		rb.WriteString("\n")
-		for _, ln := range sel.TailLines {
-			rb.WriteString(truncate(ln, right) + "\n")
-		}
-	}
-	leftBlock := lipgloss.NewStyle().Width(left).Height(h - 1).Render(lb.String())
-	rightBlock := lipgloss.NewStyle().Width(right).Height(h - 1).Render(rb.String())
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, " │ ", rightBlock)
+	return m.viewListNew()
 }
 
 func (m model) viewNew() string {

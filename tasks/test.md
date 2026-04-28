@@ -1,6 +1,6 @@
 ---
 id: test
-shared: true
+shared: false
 ---
 # test
 test
