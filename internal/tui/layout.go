@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -42,13 +43,14 @@ func (m model) viewListNew() string {
 		w, h = 120, 36
 	}
 
-	live, totalCost, costs := globalStats(m.runs, m.repoRoot)
-	spark := sparkline(costs)
-	header := fmt.Sprintf("saturn  %s  %s  %s  %s",
+	live, totalCost := globalStats(m.runs, m.repoRoot)
+	hourly := hourlyCosts(m.repoRoot, m.runs, 24)
+	header := fmt.Sprintf("saturn  %s  %s  %s  %s %s",
 		headerStat.Render(fmt.Sprintf("%d runs", len(m.runs))),
 		headerStat.Render(fmt.Sprintf("%d live", live)),
 		costStyle.Render(fmt.Sprintf("$%.2f total", totalCost)),
-		sparkColor.Render(spark))
+		sparkColor.Render(sparkline(hourly)),
+		headerStat.Render("/24h"))
 	headerLine := headerBar.Width(w).Render(header)
 
 	leftW := w / 3
@@ -85,16 +87,20 @@ func (m model) renderListPane(height int) string {
 	}
 	for i, r := range m.runs {
 		dot := badgeDot(r)
-		title := truncate(r.ID, 24)
+		title := truncate(r.ID, 22)
 		elapsed := runElapsed(m.repoRoot, r)
+		tmuxMark := ""
+		if tmux.SessionExists("saturn-" + r.ID) {
+			tmuxMark = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render(" ⌬")
+		}
 		sub := fmt.Sprintf("%d iter%s · %s", r.Iterations, plural(r.Iterations), elapsed)
 
 		if i == m.cursor {
 			rowStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("231")).Width(36).Padding(0, 1)
-			b.WriteString(rowStyle.Render(dot+" "+title) + "\n")
+			b.WriteString(rowStyle.Render(dot+" "+title+tmuxMark) + "\n")
 			b.WriteString(rowStyle.Render("  "+dim.Render(sub)) + "\n")
 		} else {
-			b.WriteString(dot + " " + statVal.Render(title) + "\n")
+			b.WriteString(dot + " " + statVal.Render(title) + tmuxMark + "\n")
 			b.WriteString("  " + dim.Render(sub) + "\n")
 		}
 	}
@@ -312,16 +318,60 @@ func branchExistsCached(repoRoot, name string) bool {
 	return v
 }
 
-func globalStats(runs []runInfo, repoRoot string) (live int, totalCost float64, costs []float64) {
+func globalStats(runs []runInfo, repoRoot string) (live int, totalCost float64) {
 	for _, r := range runs {
 		if r.StopReason == "" && r.Error == "" {
 			live++
 		}
-		c := runCost(repoRoot, r)
-		costs = append(costs, c)
-		totalCost += c
+		totalCost += runCost(repoRoot, r)
 	}
 	return
+}
+
+// hourlyCosts buckets cost events by hour for the last `hours` hours.
+// Returned slice has length `hours`, oldest first, newest last.
+func hourlyCosts(repoRoot string, runs []runInfo, hours int) []float64 {
+	if hours <= 0 {
+		return nil
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(hours) * time.Hour).Truncate(time.Hour)
+	buckets := make([]float64, hours)
+
+	for _, r := range runs {
+		path := filepath.Join(repoRoot, ".saturn", "runs", r.ID, "events.jsonl")
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+		for sc.Scan() {
+			var ev struct {
+				At  time.Time `json:"at"`
+				Raw struct {
+					Type string  `json:"type"`
+					Cost float64 `json:"total_cost_usd"`
+				} `json:"raw"`
+			}
+			if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+				continue
+			}
+			if ev.Raw.Type != "result" || ev.Raw.Cost <= 0 {
+				continue
+			}
+			if ev.At.Before(cutoff) {
+				continue
+			}
+			idx := int(ev.At.Sub(cutoff) / time.Hour)
+			if idx < 0 || idx >= hours {
+				continue
+			}
+			buckets[idx] += ev.Raw.Cost
+		}
+		f.Close()
+	}
+	return buckets
 }
 
 func sparkline(values []float64) string {
