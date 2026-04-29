@@ -65,6 +65,15 @@ func Drive(ctx context.Context, opts Options) (*Summary, error) {
 	defer iterLog.Close()
 	enc := json.NewEncoder(iterLog)
 
+	// Clear any stale STOP sentinel from a previous run on this worktree.
+	_ = os.Remove(filepath.Join(opts.Workdir, "STOP"))
+
+	// Single-shot tasks always run exactly one iteration regardless of input.
+	singleShot := opts.Task != nil && !opts.Task.Loop
+	if singleShot {
+		opts.MaxIterations = 1
+	}
+
 	sum := &Summary{}
 	iter := 0
 	for {
@@ -76,10 +85,9 @@ func Drive(ctx context.Context, opts Options) (*Summary, error) {
 			sum.Reason = StopSentinel
 			return sum, nil
 		}
-		// Only treat "no unchecked items" as a stop condition AFTER at least
-		// one iteration has run — whole-body (checklist-less) tasks must run
-		// at least once before they can finish.
-		if iter > 0 && !hasUnchecked(opts.Workdir) {
+		// Empty-checklist exit only applies in loop mode. Single-shot tasks
+		// don't manage a checklist; they finish via max-iter=1 below.
+		if !singleShot && iter > 0 && !hasUnchecked(opts.Workdir) {
 			sum.Reason = StopEmpty
 			return sum, nil
 		}

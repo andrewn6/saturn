@@ -235,7 +235,7 @@ func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) erro
 		Task:           t,
 		Workdir:        workdir,
 		RunDir:         runDir,
-		StandingPrompt: assets.StandingPrompt,
+		StandingPrompt: pickPrompt(t),
 		MaxIterations:  maxIter,
 		BeadID:         beadID,
 		OnEvent: func(iter int, ev runner.Event) {
@@ -278,4 +278,11 @@ func suffix(s string) string {
 		return ""
 	}
 	return "/" + s
+}
+
+func pickPrompt(t *task.Task) string {
+	if t.Loop {
+		return assets.StandingPrompt
+	}
+	return assets.SinglePrompt
 }
