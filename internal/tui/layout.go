@@ -33,9 +33,44 @@ var (
 	liveDot    = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("●")
 	doneDot    = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓")
 	errDot     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("✗")
-	costStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	sparkColor = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	costStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	sparkColor  = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	liveSpinner = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	stopBanner  = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("88")).Padding(0, 1).Bold(true)
 )
+
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func spinnerFrame() string {
+	return spinnerFrames[(time.Now().UnixMilli()/100)%int64(len(spinnerFrames))]
+}
+
+func formatCost(c float64) string {
+	switch {
+	case c >= 1.0:
+		return fmt.Sprintf("$%.2f", c)
+	case c >= 0.01:
+		return fmt.Sprintf("$%.3f", c)
+	default:
+		return fmt.Sprintf("$%.4f", c)
+	}
+}
+
+// readStop returns the trimmed body of <workdir>/STOP if present, else "".
+func readStop(workdir string) string {
+	if workdir == "" {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(workdir, "STOP"))
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(b))
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
 
 func (m model) viewListNew() string {
 	w, h := m.width, m.height
@@ -68,7 +103,7 @@ func (m model) viewListNew() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane)
 
-	keys := "e new · o attach · d diff · D all-diffs · m merge · w shell · K kill · r refresh · q quit"
+	keys := "e new · o attach · d diff · D all-diffs · m merge · w shell · K kill · q quit"
 	if m.flash != "" {
 		keys = m.flash + "  ·  " + keys
 	}
@@ -87,6 +122,10 @@ func (m model) renderListPane(height int) string {
 	}
 	for i, r := range m.runs {
 		dot := badgeDot(r)
+		// Use a spinner for live runs so it's obvious which are still working.
+		if r.StopReason == "" && r.Error == "" {
+			dot = liveSpinner.Render(spinnerFrame())
+		}
 		title := truncate(r.ID, 22)
 		elapsed := runElapsed(m.repoRoot, r)
 		tmuxMark := ""
@@ -117,12 +156,17 @@ func (m model) renderDetailPane(width int) string {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213")).Render("▎ " + r.ID)
 	b.WriteString(title + "  " + statusLabel(r) + "\n\n")
 
+	backend := r.Backend
+	if backend == "" {
+		backend = "(unset)"
+	}
 	stats := [][2]string{
 		{"workdir", truncate(r.Workdir, width-12)},
 		{"branch", "saturn/" + r.ID},
+		{"backend", backend},
 		{"iters", fmt.Sprintf("%d", r.Iterations)},
 		{"elapsed", runElapsed(m.repoRoot, r)},
-		{"cost", "$" + fmt.Sprintf("%.4f", runCost(m.repoRoot, r))},
+		{"cost", formatCost(runCost(m.repoRoot, r))},
 	}
 	for _, kv := range stats {
 		b.WriteString(statKey.Render(fmt.Sprintf("  %-9s", kv[0])) + statVal.Render(kv[1]) + "\n")
@@ -130,6 +174,10 @@ func (m model) renderDetailPane(width int) string {
 
 	if r.Error != "" {
 		b.WriteString("\n" + errDot + " " + errBadge.Render(r.Error) + "\n")
+	}
+
+	if reason := readStop(r.Workdir); reason != "" {
+		b.WriteString("\n" + stopBanner.Render("⨯ STOP — "+reason) + "\n")
 	}
 
 	b.WriteString("\n" + sectionHdr.Render("Live events") + "\n")
