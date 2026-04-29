@@ -284,5 +284,8 @@ func pickPrompt(t *task.Task) string {
 	if t.Loop {
 		return assets.StandingPrompt
 	}
-	return assets.SinglePrompt
+	// Single-shot: send the task body directly as the prompt. Wrapping in
+	// a "read AGENT.md, do the work" preamble was making agents think the
+	// task body was a prompt to acknowledge rather than a task to execute.
+	return t.Prompt
 }
