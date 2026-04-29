@@ -144,6 +144,19 @@ func (m model) renderDetailPane(width int) string {
 		b.WriteString("  " + dim.Render("(no events yet)") + "\n")
 	}
 
+	// Memory 
+	mem := recentMemory(m.repoRoot, 5)
+	if len(mem) > 0 {
+		b.WriteString("\n" + sectionHdr.Render("Memory") + "\n")
+		for _, ln := range mem {
+			style := dim 
+			if strings.HasPrefix(ln, "[avoid]") || strings.Contains(ln, "[avoid]") {
+				style = errBadge
+			}
+			b.WriteString(" " + style.Render(truncate(ln, width-2)) + "\n")
+		}
+	}
+
 	b.WriteString("\n" + sectionHdr.Render("Files changed") + "\n")
 	files := runFilesChanged(m.repoRoot, r)
 	if len(files) == 0 {
@@ -413,4 +426,26 @@ func sparkline(values []float64) string {
 		b.WriteRune(bars[idx])
 	}
 	return b.String()
+}
+
+func recentMemory(repoRoot string, n int) []string {
+	f, err := os.Open(filepath.Join(repoRoot, ".saturn", "memory.md"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var lines []string 
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
+	for sc.Scan() {
+		ln := strings.TrimSpace(sc.Text())
+		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "<!--") {
+			continue
+		}
+		lines = append(lines, ln)
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return lines
 }
