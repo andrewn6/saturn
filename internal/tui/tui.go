@@ -949,7 +949,7 @@ func summarizeEvent(raw []byte) []string {
 	// Opencode event shapes (step_start / text / step_finish / tool).
 	switch inner.Type {
 	case "step_start":
-		return []string{ts + " ● session started"}
+		return []string{ts + dim.Render(" ▷ step")}
 	case "text":
 		// opencode text part
 		var part struct {
@@ -969,15 +969,20 @@ func summarizeEvent(raw []byte) []string {
 			t = t[:80] + "…"
 		}
 		return []string{ts + " ▸ " + t}
-	case "tool":
+	case "tool_use":
+		// opencode shape: part.tool (name), part.state.input (object)
 		var part struct {
 			Part struct {
-				Name  string                 `json:"name"`
-				Input map[string]interface{} `json:"input"`
+				Tool  string `json:"tool"`
+				State struct {
+					Input map[string]interface{} `json:"input"`
+				} `json:"state"`
 			} `json:"part"`
 		}
 		_ = json.Unmarshal(ev.Raw, &part)
-		return []string{ts + " → " + part.Part.Name + "(" + summarizeToolArg(part.Part.Name, part.Part.Input) + ")"}
+		// Title-case tool names so they match claude's convention in display.
+		name := strings.Title(part.Part.Tool)
+		return []string{ts + " → " + name + "(" + summarizeToolArg(name, part.Part.State.Input) + ")"}
 	case "step_finish":
 		var part struct {
 			Part struct {

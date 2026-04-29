@@ -4,10 +4,12 @@ Before starting, read `.saturn/memory.md` if it exists in this repo (current dir
 
 Do this, then exit:
 
-1. Read `AGENT.md`. The body (after any front matter and title) is your task.
-2. Implement the work. Make all the changes the task requires.
-3. If you used tools to edit files, stage and commit your changes with a short message.
+1. Read `AGENT.md`. The body (after any front matter and title) is your task. Treat it as a concrete instruction you must carry out by editing files in this directory — not a prompt to acknowledge.
+2. Implement the work using your tools (Write, Edit, Bash, etc.). Create new files, modify existing files, run commands as needed. The task is complete only when the requested files exist with the requested contents. Do not stop after just reading or planning.
+3. Stage and commit your changes with a short message (`git add -A && git commit -m "..."`).
 4. Exit.
+
+Do not respond with phrases like "Received the prompt" or "I'll start by..." without then doing the work. The user wants the file/change to exist; produce it.
 
 If you get stuck or need a decision you cannot reasonably make, append a `## Blockers` section to `AGENT.md` describing the blocker and exit. Do not guess.
 
