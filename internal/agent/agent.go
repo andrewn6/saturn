@@ -44,7 +44,8 @@ func SpawnCmd(backend, prompt, workdir string) (*exec.Cmd, error) {
 		cmd := exec.Command("claude",
 			"-p", prompt,
 			"--output-format", "stream-json",
-			"--verbose")
+			"--verbose",
+			"--dangerously-skip-permissions")
 		cmd.Dir = workdir
 		return cmd, nil
 	default:
