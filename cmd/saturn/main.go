@@ -15,6 +15,7 @@ import (
 	"github.com/andrewn6/saturn/internal/agent"
 	"github.com/andrewn6/saturn/internal/assets"
 	"github.com/andrewn6/saturn/internal/beads"
+	"github.com/andrewn6/saturn/internal/gitops"
 	"github.com/andrewn6/saturn/internal/loop"
 	"github.com/andrewn6/saturn/internal/runner"
 	"github.com/andrewn6/saturn/internal/task"
@@ -38,10 +39,62 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "merge":
+		if err := mergeCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+func mergeCmd(args []string) error {
+	fs := flag.NewFlagSet("merge", flag.ExitOnError)
+	base := fs.String("base", "main", "branch to merge into")
+	skipCleanup := fs.Bool("no-cleanup", false, "leave worktree and branch in place after merge")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: saturn merge [--base main] [--no-cleanup] <task-id>")
+	}
+	taskID := fs.Arg(0)
+	branch := "saturn/" + taskID
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	root, err := worktree.RepoRoot(cwd)
+	if err != nil {
+		return err
+	}
+
+	conflicts, err := gitops.Conflicts(root, *base, branch)
+	if err != nil {
+		return fmt.Errorf("preflight: %w", err)
+	}
+	if len(conflicts) > 0 {
+		fmt.Fprintln(os.Stderr, "merge would conflict in:")
+		for _, c := range conflicts {
+			fmt.Fprintln(os.Stderr, "  ", c)
+		}
+		return fmt.Errorf("%d conflicting file(s); resolve manually then re-run", len(conflicts))
+	}
+	if err := gitops.Merge(root, *base, branch); err != nil {
+		return err
+	}
+	fmt.Printf("merged %s into %s\n", branch, *base)
+	if *skipCleanup {
+		return nil
+	}
+	if err := gitops.Cleanup(root, taskID); err != nil {
+		return fmt.Errorf("cleanup: %w (merge succeeded; run manually)", err)
+	}
+	fmt.Printf("removed worktree and branch %s\n", branch)
+	return nil
 }
 
 func watchCmd() error {
@@ -58,7 +111,8 @@ func watchCmd() error {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  saturn run [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn run   [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn merge [--base main] [--no-cleanup] <task-id>")
 	fmt.Fprintln(os.Stderr, "  saturn watch")
 }
 

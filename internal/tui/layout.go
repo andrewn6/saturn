@@ -68,7 +68,7 @@ func (m model) viewListNew() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane)
 
-	keys := "e new · o attach · d diff · D all-diffs · w shell · K kill · r refresh · q quit"
+	keys := "e new · o attach · d diff · D all-diffs · m merge · w shell · K kill · r refresh · q quit"
 	if m.flash != "" {
 		keys = m.flash + "  ·  " + keys
 	}

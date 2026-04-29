@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andrewn6/saturn/internal/agent"
+	"github.com/andrewn6/saturn/internal/gitops"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -191,6 +192,8 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openEditor()
 	case "K":
 		return m.killSession()
+	case "m":
+		return m.mergeRun()
 	case "d":
 		return m.openDiff()
 	case "D":
@@ -440,6 +443,47 @@ func (m model) openClaude() (tea.Model, tea.Cmd) {
 		}
 		return flashMsg("detached " + name + " — Ctrl+\\ detach · Ctrl+] kill (still running; K here to kill)")
 	})
+}
+
+func (m model) mergeRun() (tea.Model, tea.Cmd) {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return m, nil
+	}
+	sel := m.runs[m.cursor]
+	branch := "saturn/" + sel.ID
+	base := "main"
+	if !branchExistsCached(m.repoRoot, branch) {
+		m.flash = "no branch " + branch + " (shared mode? nothing to merge)"
+		return m, nil
+	}
+	if !branchExistsCached(m.repoRoot, base) {
+		m.flash = "no main branch — set base manually via CLI"
+		return m, nil
+	}
+	conflicts, err := gitops.Conflicts(m.repoRoot, base, branch)
+	if err != nil {
+		m.flash = "preflight: " + err.Error()
+		return m, nil
+	}
+	if len(conflicts) > 0 {
+		summary := strings.Join(conflicts, ", ")
+		if len(summary) > 80 {
+			summary = summary[:80] + "…"
+		}
+		m.flash = fmt.Sprintf("conflicts in %d file(s): %s — press w to shell in and resolve",
+			len(conflicts), summary)
+		return m, nil
+	}
+	if err := gitops.Merge(m.repoRoot, base, branch); err != nil {
+		m.flash = "merge failed: " + err.Error()
+		return m, nil
+	}
+	if err := gitops.Cleanup(m.repoRoot, sel.ID); err != nil {
+		m.flash = "merged but cleanup failed: " + err.Error()
+		return m, refreshCmd(m.root)
+	}
+	m.flash = "merged " + branch + " into " + base + " and cleaned up"
+	return m, refreshCmd(m.root)
 }
 
 func (m model) killSession() (tea.Model, tea.Cmd) {
