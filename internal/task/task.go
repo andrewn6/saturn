@@ -24,6 +24,7 @@ type Task struct {
 	Shared  bool
 	Backend string // "" = auto, "claude", "opencode"
 	Loop    bool   // false = single-shot (default), true = Ralph-style iterate
+	Plan    bool   // true = produce PLAN.md and gate on human approval before execution
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -88,6 +89,8 @@ func ParseFile(path string) (*Task, error) {
 				t.Backend = v
 			case "loop":
 				t.Loop = v == "true"
+			case "plan":
+				t.Plan = v == "true"
 			}
 			continue
 		}

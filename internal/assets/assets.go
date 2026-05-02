@@ -7,3 +7,6 @@ var StandingPrompt string
 
 //go:embed single.md
 var SinglePrompt string
+
+//go:embed plan.md
+var PlanPrompt string

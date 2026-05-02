@@ -31,6 +31,7 @@ const (
 	modeGH
 	modeDiffSummary
 	modeDiffView
+	modeModal
 )
 
 type diffEntry struct {
@@ -74,6 +75,8 @@ type model struct {
 	diffCursor  int
 
 	diff diffViewState
+
+	modal modalState
 }
 
 type tickMsg time.Time
@@ -150,6 +153,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDiffSummary(msg)
 	case modeDiffView:
 		return m.updateDiffView(msg)
+	case modeModal:
+		return m.updateModal(msg)
 	}
 	return m, nil
 }
@@ -172,18 +177,18 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "r":
 		return m, refreshCmd(m.root)
+	case "ctrl+p", "/":
+		m.modal = m.commandPalette()
+		m.mode = modeModal
+		return m, textinput.Blink
 	case "n":
-		m.mode = modeNew
-		m.focus = 0
-		m.title.Focus()
-		m.body.Blur()
-		m.flash = ""
-		return m, textinput.Blink
+		return m.openNewTask()
 	case "g":
-		m.mode = modeGH
-		m.ghRef.Focus()
-		m.flash = ""
-		return m, textinput.Blink
+		return m.openNewGH()
+	case "a":
+		return m.approveSelected()
+	case "P":
+		return m.viewPlan()
 	case "o":
 		return m.openClaude()
 	case "w":
@@ -746,6 +751,8 @@ func (m model) View() string {
 		return m.viewDiffSummary()
 	case modeDiffView:
 		return m.viewDiffView()
+	case modeModal:
+		return m.viewModal(m.viewList())
 	}
 	return m.viewList()
 }
