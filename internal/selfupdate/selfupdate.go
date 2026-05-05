@@ -24,6 +24,21 @@ type release struct {
 	} `json:"assets"`
 }
 
+// Check returns the latest release tag from GitHub without doing anything.
+// Returns (latestTag, hasUpdate, err). hasUpdate is true when currentVersion
+// is non-empty, not "dev", and != latest. "dev" is always considered out of
+// date so source builds can still test the upgrade flow.
+func Check(currentVersion string) (string, bool, error) {
+	rel, err := latestRelease()
+	if err != nil {
+		return "", false, err
+	}
+	if currentVersion == "" || currentVersion == "dev" {
+		return rel.TagName, true, nil
+	}
+	return rel.TagName, rel.TagName != currentVersion, nil
+}
+
 // Apply fetches the latest release and replaces the running binary.
 // Returns (latestTag, didUpdate, err). If currentVersion already matches
 // the latest tag, returns didUpdate=false and no error.

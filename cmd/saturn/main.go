@@ -19,9 +19,18 @@ import (
 	"github.com/andrewn6/saturn/internal/gitops"
 	"github.com/andrewn6/saturn/internal/loop"
 	"github.com/andrewn6/saturn/internal/runner"
+	"github.com/andrewn6/saturn/internal/selfupdate"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/tui"
 	"github.com/andrewn6/saturn/internal/worktree"
+)
+
+// version and commit are baked in at release-build time via goreleaser
+// ldflags (see .goreleaser.yaml). Source builds get "dev"/"" so the upgrade
+// flow always treats them as outdated and offers the latest tagged release.
+var (
+	version = "dev"
+	commit  = ""
 )
 
 func main() {
@@ -50,10 +59,49 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "version", "--version", "-v":
+		versionCmd()
+	case "upgrade", "self-update":
+		if err := upgradeCmd(); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+func versionCmd() {
+	fmt.Printf("saturn %s", version)
+	if commit != "" {
+		fmt.Printf(" (%s)", shortCommit(commit))
+	}
+	fmt.Println()
+}
+
+func shortCommit(c string) string {
+	if len(c) > 7 {
+		return c[:7]
+	}
+	return c
+}
+
+// upgradeCmd replaces the running binary with the latest GitHub release.
+// On success prints the new tag; on no-op prints the current. Errors bubble
+// out so cmd handler exits non-zero (matches every other subcommand).
+func upgradeCmd() error {
+	fmt.Printf("checking for updates (current: %s)…\n", version)
+	tag, did, err := selfupdate.Apply(version)
+	if err != nil {
+		return err
+	}
+	if !did {
+		fmt.Printf("already on latest (%s)\n", tag)
+		return nil
+	}
+	fmt.Printf("upgraded to %s\n", tag)
+	return nil
 }
 
 func mergeCmd(args []string) error {
@@ -112,15 +160,17 @@ func watchCmd() error {
 	if err != nil {
 		return err
 	}
-	return tui.Run(filepath.Join(root, ".saturn", "runs"))
+	return tui.Run(filepath.Join(root, ".saturn", "runs"), version)
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  saturn run   [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn run     [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
 	fmt.Fprintln(os.Stderr, "  saturn merge   [--base main] [--no-cleanup] <task-id>")
 	fmt.Fprintln(os.Stderr, "  saturn approve <task-id>   (resume a plan-mode task after PLAN.md review)")
 	fmt.Fprintln(os.Stderr, "  saturn watch")
+	fmt.Fprintln(os.Stderr, "  saturn upgrade   (replace this binary with the latest GitHub release)")
+	fmt.Fprintln(os.Stderr, "  saturn version")
 }
 
 func runCmd(args []string) error {
@@ -205,10 +255,10 @@ func runCmd(args []string) error {
 }
 
 const (
-	phasePlanning   = "planning"
-	phaseAwaiting   = "awaiting_approval"
-	phaseExecuting  = "executing"
-	phaseDone       = "done"
+	phasePlanning  = "planning"
+	phaseAwaiting  = "awaiting_approval"
+	phaseExecuting = "executing"
+	phaseDone      = "done"
 )
 
 func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) error {

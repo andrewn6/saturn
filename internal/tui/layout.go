@@ -23,16 +23,16 @@ var (
 			Background(lipgloss.Color("57")).
 			Padding(0, 1).
 			Bold(true)
-	headerStat = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
-	footerBar  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
-	listBox    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
-	detailBox  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
-	sectionHdr = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
-	statKey    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	statVal    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	liveDot    = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("●")
-	doneDot    = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓")
-	errDot     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("✗")
+	headerStat  = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
+	footerBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
+	listBox     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	detailBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	sectionHdr  = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
+	statKey     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	statVal     = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	liveDot     = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("●")
+	doneDot     = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓")
+	errDot      = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("✗")
 	costStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	sparkColor  = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	liveSpinner = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
@@ -86,6 +86,9 @@ func (m model) viewListNew() string {
 		costStyle.Render(fmt.Sprintf("$%.2f total", totalCost)),
 		sparkColor.Render(sparkline(hourly)),
 		headerStat.Render("/24h"))
+	if tag := m.updateHeaderTag(); tag != "" {
+		header += "  " + tag
+	}
 	headerLine := headerBar.Width(w).Render(header)
 
 	leftW := w / 3
@@ -103,7 +106,7 @@ func (m model) viewListNew() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane)
 
-	keys := "e new · o attach · d diff · D all-diffs · m merge · w shell · K kill · q quit"
+	keys := "n new · g github · e editor · o attach · d diff · D all-diffs · a approve · m merge · w shell · u upgrade · ^p palette · q quit"
 	if m.flash != "" {
 		keys = m.flash + "  ·  " + keys
 	}
@@ -113,34 +116,58 @@ func (m model) viewListNew() string {
 }
 
 func (m model) renderListPane(height int) string {
+	// width is roughly leftW-4 (border+padding) when called from viewListNew.
+	width := 32
+	if m.width > 0 {
+		w := m.width / 3
+		if w < 36 {
+			w = 36
+		}
+		width = w - 6
+	}
+
 	var b strings.Builder
 	b.WriteString(sectionHdr.Render("Runs") + "\n\n")
 	if len(m.runs) == 0 {
 		b.WriteString(dim.Render("no runs yet") + "\n")
-		b.WriteString(dim.Render("press e to write a task") + "\n")
+		b.WriteString(dim.Render("press n for a new task · g to ingest a GH issue") + "\n")
 		return b.String()
 	}
 	for i, r := range m.runs {
 		dot := badgeDot(r)
-		// Use a spinner for live runs so it's obvious which are still working.
+		// Live-run spinner so it's obvious which agents are still working.
 		if r.StopReason == "" && r.Error == "" {
 			dot = liveSpinner.Render(spinnerFrame())
 		}
-		title := truncate(r.ID, 22)
+		titleW := width - 6
+		if titleW < 12 {
+			titleW = 12
+		}
+		title := truncate(r.ID, titleW)
 		elapsed := runElapsed(m.repoRoot, r)
 		tmuxMark := ""
 		if tmux.SessionExists("saturn-" + r.ID) {
-			tmuxMark = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render(" ⌬")
+			tmuxMark = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render("⌬")
+		}
+		// Surface plan-gating state inline so users see *why* a row is paused.
+		phase := readRunPhase(m.repoRoot, r.ID)
+		phaseTag := ""
+		if phase == "awaiting_approval" {
+			phaseTag = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("◇plan")
 		}
 		sub := fmt.Sprintf("%d iter%s · %s", r.Iterations, plural(r.Iterations), elapsed)
 
 		if i == m.cursor {
-			rowStyle := lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("231")).Width(36).Padding(0, 1)
-			b.WriteString(rowStyle.Render(dot+" "+title+tmuxMark) + "\n")
+			rowStyle := lipgloss.NewStyle().
+				Background(lipgloss.Color("237")).
+				Foreground(lipgloss.Color("231")).
+				Width(width).
+				Padding(0, 1)
+			b.WriteString(rowStyle.Render(dot+" "+title+tmuxMark+phaseTag) + "\n")
 			b.WriteString(rowStyle.Render("  "+dim.Render(sub)) + "\n")
 		} else {
-			b.WriteString(dot + " " + statVal.Render(title) + tmuxMark + "\n")
-			b.WriteString("  " + dim.Render(sub) + "\n")
+			b.WriteString(" " + dot + " " + statVal.Render(title) + tmuxMark + phaseTag + "\n")
+			b.WriteString("   " + dim.Render(sub) + "\n")
 		}
 	}
 	return b.String()
@@ -192,12 +219,12 @@ func (m model) renderDetailPane(width int) string {
 		b.WriteString("  " + dim.Render("(no events yet)") + "\n")
 	}
 
-	// Memory 
+	// Memory
 	mem := recentMemory(m.repoRoot, 5)
 	if len(mem) > 0 {
 		b.WriteString("\n" + sectionHdr.Render("Memory") + "\n")
 		for _, ln := range mem {
-			style := dim 
+			style := dim
 			if strings.HasPrefix(ln, "[avoid]") || strings.Contains(ln, "[avoid]") {
 				style = errBadge
 			}
@@ -482,7 +509,7 @@ func recentMemory(repoRoot string, n int) []string {
 		return nil
 	}
 	defer f.Close()
-	var lines []string 
+	var lines []string
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	for sc.Scan() {

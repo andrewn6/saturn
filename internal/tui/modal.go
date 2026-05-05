@@ -225,6 +225,8 @@ func (m model) commandPalette() modalState {
 			action: func(m model) (tea.Model, tea.Cmd) { return m.killSession() }},
 		{label: "Refresh", shortcut: "r",
 			action: func(m model) (tea.Model, tea.Cmd) { return m, refreshCmd(m.root) }},
+		{label: "Upgrade Saturn", shortcut: "u", group: "Saturn",
+			action: func(m model) (tea.Model, tea.Cmd) { return m.openUpdate() }},
 		{label: "Quit", shortcut: "q",
 			action: func(m model) (tea.Model, tea.Cmd) { return m, tea.Quit }},
 	}

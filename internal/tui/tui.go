@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +16,6 @@ import (
 	"github.com/andrewn6/saturn/internal/gitops"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/tmux"
-	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -32,6 +30,7 @@ const (
 	modeDiffSummary
 	modeDiffView
 	modeModal
+	modeUpdate
 )
 
 type diffEntry struct {
@@ -63,13 +62,10 @@ type model struct {
 	height   int
 	err      error
 
-	mode   mode
-	title  textinput.Model
-	shared bool
-	body   textarea.Model
-	ghRef  textinput.Model
-	focus  int
-	flash  string
+	mode    mode
+	ghRef   textinput.Model
+	newTask *newTaskState
+	flash   string
 
 	diffEntries []diffEntry
 	diffCursor  int
@@ -77,6 +73,8 @@ type model struct {
 	diff diffViewState
 
 	modal modalState
+
+	update updateState
 }
 
 type tickMsg time.Time
@@ -86,30 +84,32 @@ type refreshMsg struct {
 }
 type flashMsg string
 
-func Run(runsRoot string) error {
+// Run starts the TUI. version is the current saturn version (so the update
+// modal can compare it to the latest GitHub release); pass "dev" for source
+// builds and the upgrade flow will always offer the latest tagged release.
+func Run(runsRoot, version string) error {
 	repoRoot := filepath.Dir(filepath.Dir(runsRoot))
-	ti := textinput.New()
-	ti.Placeholder = "short task title"
-	ti.CharLimit = 120
-	ti.Width = 60
-
-	ta := textarea.New()
-	ta.Placeholder = "what should the agent do? use `- [ ]` checklist lines."
-	ta.SetWidth(80)
-	ta.SetHeight(10)
 
 	gh := textinput.New()
 	gh.Placeholder = "owner/repo#123"
 	gh.CharLimit = 120
 	gh.Width = 60
 
-	m := model{root: runsRoot, repoRoot: repoRoot, title: ti, body: ta, ghRef: gh}
+	m := model{
+		root:     runsRoot,
+		repoRoot: repoRoot,
+		ghRef:    gh,
+		update:   updateState{currentVer: version},
+	}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(refreshCmd(m.root), tickCmd())
+	// Kick off an update check at startup so the header tag can light up
+	// without the user having to ask. Network failures are silent — we'd
+	// rather hide the tag than spam errors at someone offline.
+	return tea.Batch(refreshCmd(m.root), tickCmd(), updateCheckCmd(m.update.currentVer))
 }
 
 func tickCmd() tea.Cmd {
@@ -140,6 +140,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case flashMsg:
 		m.flash = string(msg)
 		return m, nil
+	case updateCheckMsg:
+		m.applyUpdateCheck(msg)
+		return m, nil
+	case updateApplyMsg:
+		m.applyUpdateResult(msg)
+		return m, nil
 	}
 
 	switch m.mode {
@@ -155,6 +161,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDiffView(msg)
 	case modeModal:
 		return m.updateModal(msg)
+	case modeUpdate:
+		return m.updateUpdate(msg)
 	}
 	return m, nil
 }
@@ -203,6 +211,8 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.openDiff()
 	case "D":
 		return m.enterDiffSummary()
+	case "u":
+		return m.openUpdate()
 	}
 	return m, nil
 }
@@ -532,46 +542,6 @@ func (m model) openShell() (tea.Model, tea.Cmd) {
 	})
 }
 
-func (m model) updateNew(msg tea.Msg) (tea.Model, tea.Cmd) {
-	km, isKey := msg.(tea.KeyMsg)
-	if isKey {
-		switch km.String() {
-		case "esc":
-			m.mode = modeList
-			m.title.Blur()
-			m.body.Blur()
-			return m, nil
-		case "tab":
-			m.focus = (m.focus + 1) % 3
-			m.applyFocus()
-			return m, nil
-		case "shift+tab":
-			m.focus = (m.focus + 2) % 3
-			m.applyFocus()
-			return m, nil
-		case "ctrl+s":
-			return m.submitNew()
-		case " ":
-			if m.focus == 1 {
-				m.shared = !m.shared
-				return m, nil
-			}
-		}
-	}
-	var cmds []tea.Cmd
-	switch m.focus {
-	case 0:
-		var c tea.Cmd
-		m.title, c = m.title.Update(msg)
-		cmds = append(cmds, c)
-	case 2:
-		var c tea.Cmd
-		m.body, c = m.body.Update(msg)
-		cmds = append(cmds, c)
-	}
-	return m, tea.Batch(cmds...)
-}
-
 func (m model) updateGH(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if km, ok := msg.(tea.KeyMsg); ok {
 		switch km.String() {
@@ -588,58 +558,6 @@ func (m model) updateGH(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, c
 }
 
-func (m *model) applyFocus() {
-	m.title.Blur()
-	m.body.Blur()
-	switch m.focus {
-	case 0:
-		m.title.Focus()
-	case 2:
-		m.body.Focus()
-	}
-}
-
-var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
-
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = slugRe.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
-	if s == "" {
-		s = fmt.Sprintf("task-%d", time.Now().Unix())
-	}
-	return s
-}
-
-func (m model) submitNew() (tea.Model, tea.Cmd) {
-	title := strings.TrimSpace(m.title.Value())
-	body := strings.TrimSpace(m.body.Value())
-	if title == "" || body == "" {
-		m.flash = "title and body required"
-		return m, nil
-	}
-	id := slugify(title)
-	content := fmt.Sprintf("---\nid: %s\nshared: %t\n---\n# %s\n%s\n", id, m.shared, title, body)
-	path := filepath.Join(m.repoRoot, "tasks", id+".md")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		m.flash = "mkdir: " + err.Error()
-		return m, nil
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		m.flash = "write: " + err.Error()
-		return m, nil
-	}
-	spawnRun(m.repoRoot, path)
-	m.mode = modeList
-	m.title.SetValue("")
-	m.body.SetValue("")
-	m.shared = false
-	m.title.Blur()
-	m.body.Blur()
-	m.flash = "launched " + id
-	return m, refreshCmd(m.root)
-}
-
 func (m model) submitGH() (tea.Model, tea.Cmd) {
 	ref := strings.TrimSpace(m.ghRef.Value())
 	if ref == "" {
@@ -654,14 +572,20 @@ func (m model) submitGH() (tea.Model, tea.Cmd) {
 	return m, refreshCmd(m.root)
 }
 
-func spawnRun(repoRoot, taskPath string) { spawnRunArg(repoRoot, taskPath) }
-
+// spawnRunArg backgrounds a `saturn run <arg>` invocation. Used by the GH
+// intake screen and the editor flow; output is appended to .saturn/tui-spawned.log
+// so the user can `tail -f` it from a shell while the TUI keeps drawing.
 func spawnRunArg(repoRoot, arg string) {
+	spawnSaturn(repoRoot, "run", arg)
+}
+
+// spawnSaturn is the variadic form: backgrounds an arbitrary saturn subcommand.
+func spawnSaturn(repoRoot string, args ...string) {
 	exe, err := os.Executable()
 	if err != nil {
 		exe = "saturn"
 	}
-	cmd := exec.Command(exe, "run", arg)
+	cmd := exec.Command(exe, args...)
 	cmd.Dir = repoRoot
 	logPath := filepath.Join(repoRoot, ".saturn", "tui-spawned.log")
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
@@ -731,8 +655,6 @@ Describe the task here. Either write a free-form prompt, or list work as:
 
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	rowSel     = lipgloss.NewStyle().Background(lipgloss.Color("238")).Foreground(lipgloss.Color("230"))
-	rowNormal  = lipgloss.NewStyle()
 	dim        = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	okBadge    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	errBadge   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
@@ -753,6 +675,8 @@ func (m model) View() string {
 		return m.viewDiffView()
 	case modeModal:
 		return m.viewModal(m.viewList())
+	case modeUpdate:
+		return m.viewUpdate()
 	}
 	return m.viewList()
 }
@@ -764,36 +688,31 @@ func (m model) viewList() string {
 	return m.viewListNew()
 }
 
-func (m model) viewNew() string {
-	sharedLabel := "[ ] shared worktree"
-	if m.shared {
-		sharedLabel = "[x] shared worktree"
-	}
-	sharedStyled := sharedLabel
-	if m.focus == 1 {
-		sharedStyled = rowSel.Render(sharedLabel)
-	}
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("new task") + "\n\n")
-	b.WriteString(labelStyle.Render("title") + "\n" + m.title.View() + "\n\n")
-	b.WriteString(labelStyle.Render("shared") + "  " + sharedStyled + dim.Render("  (space to toggle)") + "\n\n")
-	b.WriteString(labelStyle.Render("body") + "\n" + m.body.View() + "\n\n")
-	if m.flash != "" {
-		b.WriteString(errBadge.Render(m.flash) + "\n")
-	}
-	b.WriteString(dim.Render("tab next · shift+tab prev · ctrl+s submit · esc cancel"))
-	return boxStyle.Render(b.String())
-}
-
 func (m model) viewGH() string {
+	w := m.width
+	if w == 0 {
+		w = 100
+	}
+	boxW := w - 4
+	if boxW > 80 {
+		boxW = 80
+	}
+	if boxW < 50 {
+		boxW = 50
+	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("launch from github issue") + "\n\n")
+	b.WriteString(titleStyle.Render("▎ launch from github issue") + "\n\n")
 	b.WriteString(labelStyle.Render("ref") + "\n" + m.ghRef.View() + "\n\n")
 	if m.flash != "" {
-		b.WriteString(errBadge.Render(m.flash) + "\n")
+		b.WriteString(errBadge.Render(m.flash) + "\n\n")
 	}
 	b.WriteString(dim.Render("enter submit · esc cancel"))
-	return boxStyle.Render(b.String())
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("99")).
+		Padding(1, 2).
+		Width(boxW).
+		Render(b.String())
 }
 
 func badge(r runInfo) string {
