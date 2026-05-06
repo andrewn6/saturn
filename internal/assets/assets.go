@@ -10,3 +10,6 @@ var SinglePrompt string
 
 //go:embed plan.md
 var PlanPrompt string
+
+//go:embed architect.md
+var ArchitectPrompt string

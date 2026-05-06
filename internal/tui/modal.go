@@ -195,7 +195,15 @@ func (m model) commandPalette() modalState {
 	if hasRuns {
 		sel = m.runs[m.cursor]
 	}
-	awaiting := hasRuns && readRunPhase(m.repoRoot, sel.ID) == "awaiting_approval"
+	// Approve is enabled for any awaiting_* phase (stack approval, plan
+	// approval, or the legacy awaiting_approval written by older builds).
+	awaiting := false
+	if hasRuns {
+		switch readRunPhase(m.repoRoot, sel.ID) {
+		case "awaiting_stack", "awaiting_plan", "awaiting_approval":
+			awaiting = true
+		}
+	}
 
 	items := []modalItem{
 		{label: "New Task", shortcut: "n", group: "Create",
@@ -203,8 +211,10 @@ func (m model) commandPalette() modalState {
 		{label: "New from GitHub Issue", shortcut: "g",
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openNewGH() }},
 
-		{label: "Approve Plan", shortcut: "a", group: "Plan", disabled: !awaiting,
+		{label: "Approve current gate (stack/plan)", shortcut: "a", group: "Approval", disabled: !awaiting,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.approveSelected() }},
+		{label: "View STACK.md (architect output)", shortcut: "S", disabled: !hasRuns,
+			action: func(m model) (tea.Model, tea.Cmd) { return m.viewStack() }},
 		{label: "View PLAN.md", shortcut: "P", disabled: !hasRuns,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.viewPlan() }},
 

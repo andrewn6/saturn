@@ -20,13 +20,14 @@ import (
 type newTaskState struct {
 	form *huh.Form
 
-	title   string
-	body    string
-	backend string // "" | "claude" | "opencode"
-	loop    bool
-	plan    bool
-	shared  bool
-	maxIter string // textinput; parsed on submit (empty = use CLI default)
+	title     string
+	body      string
+	backend   string // "" | "claude" | "opencode"
+	loop      bool
+	plan      bool
+	architect bool
+	shared    bool
+	maxIter   string // textinput; parsed on submit (empty = use CLI default)
 }
 
 // newTaskForm builds a four-group huh form: basics → behavior → execution →
@@ -85,10 +86,18 @@ func newTaskForm() *newTaskState {
 		Negative("Single-shot").
 		Value(&st.loop)
 
+	architectField := huh.NewConfirm().
+		Key("architect").
+		Title("Architect first? (stack & trade-off analysis)").
+		Description("Agent writes STACK.md weighing alternatives (e.g. k3s vs k8s) and gates on `a`. Use for greenfield or any task with real tech choices.").
+		Affirmative("Architect first").
+		Negative("Skip").
+		Value(&st.architect)
+
 	planField := huh.NewConfirm().
 		Key("plan").
 		Title("Gate on PLAN.md?").
-		Description("Agent writes PLAN.md first; you `a` to approve before execution.").
+		Description("Agent writes PLAN.md (stepwise plan) and gates on `a`. Stacks with architect: stack approved → plan approved → execute.").
 		Affirmative("Plan first").
 		Negative("Skip planning").
 		Value(&st.plan)
@@ -121,7 +130,7 @@ func newTaskForm() *newTaskState {
 
 	form := huh.NewForm(
 		huh.NewGroup(titleField, bodyField).Title("Task"),
-		huh.NewGroup(backendField, loopField, planField).Title("Behavior"),
+		huh.NewGroup(backendField, loopField, architectField, planField).Title("Behavior"),
 		huh.NewGroup(sharedField, maxIterField).Title("Execution"),
 	).
 		WithTheme(huh.ThemeCharm()).
@@ -237,6 +246,9 @@ func (m model) submitNewTask() (tea.Model, tea.Cmd) {
 	}
 	if st.loop {
 		fm.WriteString("loop: true\n")
+	}
+	if st.architect {
+		fm.WriteString("architect: true\n")
 	}
 	if st.plan {
 		fm.WriteString("plan: true\n")

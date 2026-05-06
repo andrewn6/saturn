@@ -197,6 +197,8 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.approveSelected()
 	case "P":
 		return m.viewPlan()
+	case "S":
+		return m.viewStack()
 	case "o":
 		return m.openClaude()
 	case "w":

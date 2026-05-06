@@ -106,7 +106,7 @@ func (m model) viewListNew() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane)
 
-	keys := "n new · g github · e editor · o attach · d diff · D all-diffs · a approve · m merge · w shell · u upgrade · ^p palette · q quit"
+	keys := "n new · g github · e editor · o attach · d diff · D all-diffs · a approve · S stack · P plan · m merge · w shell · u upgrade · ^p palette · q quit"
 	if m.flash != "" {
 		keys = m.flash + "  ·  " + keys
 	}
@@ -149,10 +149,15 @@ func (m model) renderListPane(height int) string {
 		if tmux.SessionExists("saturn-" + r.ID) {
 			tmuxMark = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render("⌬")
 		}
-		// Surface plan-gating state inline so users see *why* a row is paused.
+		// Surface gating state inline so users see *why* a row is paused.
+		// Stack and plan use distinct tags so the same `a` keybind has
+		// obvious context. The legacy "awaiting_approval" maps to plan.
 		phase := readRunPhase(m.repoRoot, r.ID)
 		phaseTag := ""
-		if phase == "awaiting_approval" {
+		switch phase {
+		case "awaiting_stack":
+			phaseTag = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("◇stack")
+		case "awaiting_plan", "awaiting_approval":
 			phaseTag = " " + lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("◇plan")
 		}
 		sub := fmt.Sprintf("%d iter%s · %s", r.Iterations, plural(r.Iterations), elapsed)

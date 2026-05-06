@@ -17,14 +17,15 @@ const (
 )
 
 type Task struct {
-	ID      string
-	Title   string
-	Prompt  string
-	Source  Source
-	Shared  bool
-	Backend string // "" = auto, "claude", "opencode"
-	Loop    bool   // false = single-shot (default), true = Ralph-style iterate
-	Plan    bool   // true = produce PLAN.md and gate on human approval before execution
+	ID        string
+	Title     string
+	Prompt    string
+	Source    Source
+	Shared    bool
+	Backend   string // "" = auto, "claude", "opencode"
+	Loop      bool   // false = single-shot (default), true = Ralph-style iterate
+	Plan      bool   // true = produce PLAN.md and gate on human approval before execution
+	Architect bool   // true = produce STACK.md (stack/trade-off analysis) and gate before plan/execute
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -91,6 +92,8 @@ func ParseFile(path string) (*Task, error) {
 				t.Loop = v == "true"
 			case "plan":
 				t.Plan = v == "true"
+			case "architect":
+				t.Architect = v == "true"
 			}
 			continue
 		}
