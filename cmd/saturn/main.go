@@ -18,6 +18,7 @@ import (
 	"github.com/andrewn6/saturn/internal/beads"
 	"github.com/andrewn6/saturn/internal/gitops"
 	"github.com/andrewn6/saturn/internal/loop"
+	"github.com/andrewn6/saturn/internal/paths"
 	"github.com/andrewn6/saturn/internal/runner"
 	"github.com/andrewn6/saturn/internal/selfupdate"
 	"github.com/andrewn6/saturn/internal/task"
@@ -39,6 +40,16 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "init":
+		if err := initCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "plan":
+		if err := planCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "run":
 		if err := runCmd(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -160,11 +171,14 @@ func watchCmd() error {
 	if err != nil {
 		return err
 	}
-	return tui.Run(filepath.Join(root, ".saturn", "runs"), version)
+	return tui.Run(paths.RunsRoot(root), version)
 }
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  saturn init    [--force] [--no-example]")
+	fmt.Fprintln(os.Stderr, "  saturn plan    [--out <dir>] [--shared] [--cleanup] [--max-iter N]")
+	fmt.Fprintln(os.Stderr, "                 \"<idea>\" | --from <file.md>")
 	fmt.Fprintln(os.Stderr, "  saturn run     [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
 	fmt.Fprintln(os.Stderr, "  saturn merge   [--base main] [--no-cleanup] <task-id>")
 	fmt.Fprintln(os.Stderr, "  saturn approve <task-id>   (resume a plan-mode task after PLAN.md review)")
@@ -254,24 +268,37 @@ func runCmd(args []string) error {
 	return nil
 }
 
+// Phase tags persisted to .saturn/runs/<id>/phase. The state machine for a
+// task with both architect:true and plan:true is:
+//
+//	architecting → awaiting_stack → planning → awaiting_plan → executing → done
+//
+// Tasks with only plan:true skip the architect/stack states; tasks with
+// neither flag run executing → done in one go. `saturn approve` advances
+// whichever awaiting_* state is current to the next non-awaiting state.
 const (
-	phasePlanning  = "planning"
-	phaseAwaiting  = "awaiting_approval"
-	phaseExecuting = "executing"
-	phaseDone      = "done"
+	phaseArchitecting  = "architecting"
+	phaseAwaitingStack = "awaiting_stack"
+	phasePlanning      = "planning"
+	phaseAwaitingPlan  = "awaiting_plan"
+	// phaseAwaitingApproval is kept for backward compat with on-disk state
+	// from older builds — `saturn approve` treats it as awaiting_plan.
+	phaseAwaitingApproval = "awaiting_approval"
+	phaseExecuting        = "executing"
+	phaseDone             = "done"
 )
 
 func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) error {
 	workdir := root
-	branch := "saturn/" + t.ID
+	branch := paths.Branch(t.ID)
 	if !t.Shared {
-		workdir = filepath.Join(root, ".saturn", "wt", t.ID)
+		workdir = paths.Worktree(root, t.ID)
 		if err := worktree.Add(root, workdir, branch); err != nil {
 			return err
 		}
 	}
 
-	runDir := filepath.Join(root, ".saturn", "runs", t.ID)
+	runDir := paths.RunDir(root, t.ID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
@@ -286,50 +313,92 @@ func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) erro
 		_ = os.WriteFile(filepath.Join(runDir, "task.json"), tb, 0o644)
 	}
 
-	// Plan-mode routing: produce PLAN.md and stop until human approves.
-	if t.Plan {
-		ph := readPhase(runDir)
+	// Walk the state machine. Each gated phase (architect, plan) runs once,
+	// flips the on-disk phase to its awaiting_* state, and returns — the user
+	// resumes via `saturn approve`. The phase file is the single source of
+	// truth so this function is safe to re-enter from `approveCmd`.
+	ph := readPhase(runDir)
+
+	if t.Architect {
 		switch ph {
-		case "", phasePlanning:
+		case "", phaseArchitecting:
+			if err := writePhase(runDir, phaseArchitecting); err != nil {
+				return err
+			}
+			if err := runPhase(ctx, root, t, workdir, runDir, maxIter, phaseArchitecting); err != nil {
+				return err
+			}
+			if err := writePhase(runDir, phaseAwaitingStack); err != nil {
+				return err
+			}
+			fmt.Printf("[%s] STACK.md ready: %s\n", t.ID, filepath.Join(workdir, "STACK.md"))
+			fmt.Printf("[%s] review then run: saturn approve %s\n", t.ID, t.ID)
+			return nil
+		case phaseAwaitingStack:
+			return fmt.Errorf("task %s is awaiting stack approval; run: saturn approve %s", t.ID, t.ID)
+		}
+		// fall through: ph is past the architect gate
+	}
+
+	if t.Plan {
+		switch ph {
+		case "", phasePlanning, phaseArchitecting:
+			// "" or phaseArchitecting can land here when architect is off, or
+			// when approveCmd has just bumped us past awaiting_stack.
 			if err := writePhase(runDir, phasePlanning); err != nil {
 				return err
 			}
-			if err := runPhase(ctx, root, t, workdir, runDir, maxIter, true); err != nil {
+			if err := runPhase(ctx, root, t, workdir, runDir, maxIter, phasePlanning); err != nil {
 				return err
 			}
-			if err := writePhase(runDir, phaseAwaiting); err != nil {
+			if err := writePhase(runDir, phaseAwaitingPlan); err != nil {
 				return err
 			}
 			fmt.Printf("[%s] PLAN.md ready: %s\n", t.ID, filepath.Join(workdir, "PLAN.md"))
 			fmt.Printf("[%s] review then run: saturn approve %s\n", t.ID, t.ID)
 			return nil
-		case phaseAwaiting:
-			return fmt.Errorf("task %s is awaiting approval; run: saturn approve %s", t.ID, t.ID)
-		case phaseExecuting, phaseDone:
-			// fall through to execute phase
+		case phaseAwaitingPlan, phaseAwaitingApproval:
+			return fmt.Errorf("task %s is awaiting plan approval; run: saturn approve %s", t.ID, t.ID)
 		}
+		// fall through: ph is past the plan gate
 	}
 
-	if err := runPhase(ctx, root, t, workdir, runDir, maxIter, false); err != nil {
+	if err := runPhase(ctx, root, t, workdir, runDir, maxIter, phaseExecuting); err != nil {
 		return err
 	}
-	if t.Plan {
+	if t.Plan || t.Architect {
 		_ = writePhase(runDir, phaseDone)
 	}
 	return nil
 }
 
-func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir string, maxIter int, planning bool) error {
+// runPhase executes one phase (architect, plan, or execute). The phase tag
+// drives:
+//   - which standing prompt to send (architect.md / plan.md / task body)
+//   - log + result filenames (events[.architect|.plan].jsonl, result*.json)
+//   - whether to force single-shot (architect and plan ignore t.Loop)
+//   - whether to close the beads issue at the end (only the exec phase does)
+func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir string, maxIter int, phase string) error {
 	beadID, err := beads.Create(root, t.Title, []string{"saturn", "task:" + t.ID})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[%s] warn: bd create failed: %v\n", t.ID, err)
 	}
 
-	logName := "events.jsonl"
-	if planning {
-		logName = "events.plan.jsonl"
+	gated := phase == phaseArchitecting || phase == phasePlanning
+
+	// Short tags drive log filenames and stdout prefixes; keep them stable
+	// because TUI/external scripts may grep for them.
+	var shortTag, logSuffix string
+	switch phase {
+	case phaseArchitecting:
+		shortTag, logSuffix = "arch", ".architect"
+	case phasePlanning:
+		shortTag, logSuffix = "plan", ".plan"
+	default:
+		shortTag, logSuffix = "exec", ""
 	}
-	logFile, err := os.Create(filepath.Join(runDir, logName))
+
+	logFile, err := os.Create(filepath.Join(runDir, "events"+logSuffix+".jsonl"))
 	if err != nil {
 		return err
 	}
@@ -337,16 +406,15 @@ func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir st
 	enc := json.NewEncoder(logFile)
 	var mu sync.Mutex
 
-	phaseTag := "exec"
-	if planning {
-		phaseTag = "plan"
-	}
-	fmt.Printf("[%s/%s] start workdir=%s\n", t.ID, phaseTag, workdir)
+	fmt.Printf("[%s/%s] start workdir=%s\n", t.ID, shortTag, workdir)
 
 	driveTaskCopy := *t
 	standingPrompt := pickPrompt(t)
-	if planning {
-		// Plan phase always runs as a single iteration regardless of t.Loop.
+	switch phase {
+	case phaseArchitecting:
+		driveTaskCopy.Loop = false
+		standingPrompt = assets.ArchitectPrompt
+	case phasePlanning:
 		driveTaskCopy.Loop = false
 		standingPrompt = assets.PlanPrompt
 	}
@@ -362,7 +430,7 @@ func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir st
 			mu.Lock()
 			_ = enc.Encode(ev)
 			mu.Unlock()
-			fmt.Printf("[%s/%s#%d %s] %s%s\n", t.ID, phaseTag, iter, ev.At.Format("15:04:05"), ev.Type, suffix(ev.Subtype))
+			fmt.Printf("[%s/%s#%d %s] %s%s\n", t.ID, shortTag, iter, ev.At.Format("15:04:05"), ev.Type, suffix(ev.Subtype))
 		},
 	})
 
@@ -370,7 +438,7 @@ func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir st
 		"ended_at":   time.Now().Format(time.RFC3339),
 		"iterations": 0,
 		"backend":    agent.Resolve(t.Backend),
-		"phase":      phaseTag,
+		"phase":      shortTag,
 	}
 	if sum != nil {
 		res["iterations"] = len(sum.Iterations)
@@ -380,21 +448,19 @@ func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir st
 		res["error"] = err.Error()
 	}
 	b, _ := json.MarshalIndent(res, "", "  ")
-	resultName := "result.json"
-	if planning {
-		resultName = "result.plan.json"
-	}
-	_ = os.WriteFile(filepath.Join(runDir, resultName), b, 0o644)
+	_ = os.WriteFile(filepath.Join(runDir, "result"+logSuffix+".json"), b, 0o644)
 
 	if err != nil {
 		return err
 	}
-	if !planning && sum.Reason == loop.StopEmpty {
+	// Only the executor phase resolves the beads issue. Architect/plan close
+	// nothing because the work isn't done — they just produced an artifact.
+	if !gated && sum.Reason == loop.StopEmpty {
 		if cerr := beads.Close(root, beadID); cerr != nil {
 			fmt.Fprintf(os.Stderr, "[%s] warn: bd close: %v\n", t.ID, cerr)
 		}
 	}
-	fmt.Printf("[%s/%s] done iterations=%d stop=%s bead=%s\n", t.ID, phaseTag, len(sum.Iterations), sum.Reason, beadID)
+	fmt.Printf("[%s/%s] done iterations=%d stop=%s bead=%s\n", t.ID, shortTag, len(sum.Iterations), sum.Reason, beadID)
 	return nil
 }
 
@@ -430,11 +496,8 @@ func approveCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	runDir := filepath.Join(root, ".saturn", "runs", taskID)
+	runDir := paths.RunDir(root, taskID)
 	ph := readPhase(runDir)
-	if ph != phaseAwaiting {
-		return fmt.Errorf("task %s phase=%q (need %q); nothing to approve", taskID, ph, phaseAwaiting)
-	}
 
 	var t *task.Task
 	if *taskFile != "" {
@@ -453,8 +516,30 @@ func approveCmd(args []string) error {
 		}
 	}
 
-	if err := writePhase(runDir, phaseExecuting); err != nil {
-		return err
+	// Advance whichever gate is current. driveTask is re-entrant against
+	// the on-disk phase, so we just need to bump it to the next non-awaiting
+	// state and let driveTask take over.
+	switch ph {
+	case phaseAwaitingStack:
+		// Stack approved. If plan is also requested, jump to planning;
+		// otherwise straight to execute.
+		if t.Plan {
+			if err := writePhase(runDir, phasePlanning); err != nil {
+				return err
+			}
+		} else {
+			if err := writePhase(runDir, phaseExecuting); err != nil {
+				return err
+			}
+		}
+	case phaseAwaitingPlan, phaseAwaitingApproval:
+		// Plan approved (or legacy awaiting_approval from older builds).
+		if err := writePhase(runDir, phaseExecuting); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("task %s phase=%q; nothing to approve (expected %s or %s)",
+			taskID, ph, phaseAwaitingStack, phaseAwaitingPlan)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/andrewn6/saturn/internal/agent"
+	"github.com/andrewn6/saturn/internal/paths"
+	"github.com/andrewn6/saturn/internal/slug"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -23,6 +24,8 @@ type newTaskState struct {
 	title     string
 	body      string
 	backend   string // "" | "claude" | "opencode"
+	model     string // "" = backend default; depends on backend
+	variant   string // "" = backend default; depends on model
 	loop      bool
 	plan      bool
 	architect bool
@@ -78,6 +81,54 @@ func newTaskForm() *newTaskState {
 		).
 		Value(&st.backend)
 
+	// Model select: options depend on the chosen backend. The first option
+	// is always "(backend default)" so users who don't care can keep
+	// flying through the form. huh re-runs OptionsFunc whenever &st.backend
+	// changes, so picking opencode after claude refreshes the list cleanly.
+	//
+	// We also reset st.model when the backend flips, otherwise a stale
+	// "claude/opus" id sticks around and confuses translateVariant.
+	modelField := huh.NewSelect[string]().
+		Key("model").
+		Title("Model").
+		Description("Specific model. \"(default)\" lets the backend pick.").
+		Height(8).
+		Value(&st.model).
+		OptionsFunc(func() []huh.Option[string] {
+			opts := []huh.Option[string]{huh.NewOption("(backend default)", "")}
+			for _, m := range agent.Catalog(st.backend) {
+				opts = append(opts, huh.NewOption(m.Label, m.ID))
+			}
+			// If the previously-selected model isn't in the new catalog,
+			// snap back to default so submission doesn't pass a stale id.
+			if !modelInCatalog(st.backend, st.model) {
+				st.model = ""
+				st.variant = ""
+			}
+			return opts
+		}, &st.backend)
+
+	// Variant select: depends on the chosen model. Reasoning/effort tier.
+	// "(default)" again means "let the backend pick"; saturn translates
+	// the chosen value per-backend (--effort for claude, --variant for
+	// opencode) at spawn time.
+	variantField := huh.NewSelect[string]().
+		Key("variant").
+		Title("Variant / effort").
+		Description("Reasoning effort tier. claude: --effort, opencode: --variant.").
+		Height(7).
+		Value(&st.variant).
+		OptionsFunc(func() []huh.Option[string] {
+			opts := []huh.Option[string]{huh.NewOption("(default)", "")}
+			for _, v := range variantsFor(st.backend, st.model) {
+				opts = append(opts, huh.NewOption(v, v))
+			}
+			if !variantInCatalog(st.backend, st.model, st.variant) {
+				st.variant = ""
+			}
+			return opts
+		}, &st.model)
+
 	loopField := huh.NewConfirm().
 		Key("loop").
 		Title("Loop until done? (Ralph mode)").
@@ -130,7 +181,8 @@ func newTaskForm() *newTaskState {
 
 	form := huh.NewForm(
 		huh.NewGroup(titleField, bodyField).Title("Task"),
-		huh.NewGroup(backendField, loopField, architectField, planField).Title("Behavior"),
+		huh.NewGroup(backendField, modelField, variantField).Title("Model"),
+		huh.NewGroup(loopField, architectField, planField).Title("Behavior"),
 		huh.NewGroup(sharedField, maxIterField).Title("Execution"),
 	).
 		WithTheme(huh.ThemeCharm()).
@@ -206,20 +258,50 @@ func (m model) viewNew() string {
 	return box
 }
 
-var newTaskSlugRe = regexp.MustCompile(`[^a-z0-9]+`)
-
-// taskSlug mirrors internal/task.slugify so the id we write into front matter
-// matches what task.ParseFile will derive when re-reading the file. We can't
-// import task.slugify directly (unexported); keep the two implementations
-// identical or things like .saturn/wt/<id>/ will diverge from <id>.md.
-func taskSlug(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = newTaskSlugRe.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
-	if s == "" {
-		s = fmt.Sprintf("task-%d", time.Now().Unix())
+// modelInCatalog reports whether id is a known model for the given backend.
+// Used by the dependent Model select to drop a stale selection when the
+// backend changes (so e.g. claude's "opus" alias doesn't survive a switch
+// to opencode where the id format is "anthropic/claude-opus-4-7").
+func modelInCatalog(backend, id string) bool {
+	if id == "" {
+		return true
 	}
-	return s
+	for _, m := range agent.Catalog(backend) {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// variantsFor returns the variant tier list for the given backend+model.
+// Falls back to the backend's first model's variants when no model is
+// chosen yet, so the variant select isn't empty just because the user
+// hasn't picked a model.
+func variantsFor(backend, modelID string) []string {
+	cat := agent.Catalog(backend)
+	if modelID == "" && len(cat) > 0 {
+		return cat[0].Variants
+	}
+	for _, m := range cat {
+		if m.ID == modelID {
+			return m.Variants
+		}
+	}
+	return nil
+}
+
+// variantInCatalog reports whether v is a valid variant for backend+model.
+func variantInCatalog(backend, modelID, v string) bool {
+	if v == "" {
+		return true
+	}
+	for _, candidate := range variantsFor(backend, modelID) {
+		if candidate == v {
+			return true
+		}
+	}
+	return false
 }
 
 func (m model) submitNewTask() (tea.Model, tea.Cmd) {
@@ -232,7 +314,7 @@ func (m model) submitNewTask() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	id := taskSlug(title)
+	id := slug.MakeOrFallback(title, "task")
 
 	// Compose the markdown with all the front-matter knobs the form gathered.
 	// Mirror cmd/saturn's expected schema: keys are written only when their
@@ -243,6 +325,12 @@ func (m model) submitNewTask() (tea.Model, tea.Cmd) {
 	fmt.Fprintf(&fm, "title: %s\n", title)
 	if st.backend != "" {
 		fmt.Fprintf(&fm, "backend: %s\n", st.backend)
+	}
+	if st.model != "" {
+		fmt.Fprintf(&fm, "model: %s\n", st.model)
+	}
+	if st.variant != "" {
+		fmt.Fprintf(&fm, "variant: %s\n", st.variant)
 	}
 	if st.loop {
 		fm.WriteString("loop: true\n")
@@ -259,7 +347,7 @@ func (m model) submitNewTask() (tea.Model, tea.Cmd) {
 	fm.WriteString("---\n")
 
 	content := fmt.Sprintf("%s# %s\n\n%s\n", fm.String(), title, body)
-	path := filepath.Join(m.repoRoot, "tasks", id+".md")
+	path := filepath.Join(paths.TasksDir(m.repoRoot), id+".md")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		m.flash = "mkdir: " + err.Error()
 		return m, nil

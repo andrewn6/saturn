@@ -32,7 +32,13 @@ type Result struct {
 // closes when the subprocess exits. Call the returned wait func to collect
 // the exit code and the full event slice.
 func Run(ctx context.Context, t *task.Task, workdir string) (<-chan Event, func() (*Result, error), error) {
-	cmd, err := agent.SpawnCmd(t.Backend, t.Prompt, workdir)
+	cmd, err := agent.SpawnCmd(agent.SpawnOptions{
+		Backend: t.Backend,
+		Prompt:  t.Prompt,
+		Workdir: workdir,
+		Model:   t.Model,
+		Variant: t.Variant,
+	})
 	if err != nil {
 		return nil, nil, err
 	}

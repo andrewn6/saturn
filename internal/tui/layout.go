@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrewn6/saturn/internal/paths"
 	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -23,8 +24,15 @@ var (
 			Background(lipgloss.Color("57")).
 			Padding(0, 1).
 			Bold(true)
-	headerStat  = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
-	footerBar   = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
+	headerStat = lipgloss.NewStyle().Foreground(lipgloss.Color("249"))
+	footerBar  = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Padding(0, 1)
+	// Footer pairs: cyan key, dim label, even-dimmer separators. Picking
+	// readable contrast for the key (the thing your eye should land on)
+	// and pushing everything else into the background.
+	footerKey   = lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Bold(true)
+	footerLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	footerSep   = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	footerFlash = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	listBox     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
 	detailBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
 	sectionHdr  = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
@@ -106,13 +114,78 @@ func (m model) viewListNew() string {
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane)
 
-	keys := "n new · g github · e editor · o attach · d diff · D all-diffs · a approve · S stack · P plan · m merge · w shell · u upgrade · ^p palette · q quit"
-	if m.flash != "" {
-		keys = m.flash + "  ·  " + keys
-	}
-	footer := footerBar.Width(w).Render(keys)
+	footer := footerBar.Width(w).Render(m.renderFooter())
 
 	return headerLine + "\n" + body + "\n" + footer
+}
+
+// renderFooter draws a minimal context-aware key hint. We deliberately keep
+// it tiny — every action lives in the command palette (`?` / ^p), and the
+// footer's job is to point you there, not to enumerate fourteen bindings.
+//
+// The hint adapts: `a approve` only appears when the highlighted run is
+// gated; `m merge` only when there's a finished run to merge. Keys are
+// rendered in cyan, labels in dim — much easier to scan than the previous
+// flat dot-separated string.
+func (m model) renderFooter() string {
+	pairs := []kbHint{
+		{"n", "new"},
+		{"d", "diff"},
+	}
+	if m.selectedAwaitingApproval() {
+		pairs = append(pairs, kbHint{"a", "approve"})
+	}
+	if m.selectedReadyToMerge() {
+		pairs = append(pairs, kbHint{"m", "merge"})
+	}
+	pairs = append(pairs,
+		kbHint{"?", "actions"},
+		kbHint{"q", "quit"},
+	)
+
+	parts := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		parts = append(parts, footerKey.Render(p.key)+" "+footerLabel.Render(p.label))
+	}
+	hint := strings.Join(parts, footerSep.Render("  ·  "))
+
+	if m.flash != "" {
+		// flash is transient feedback ("merged saturn/foo"), shown left of
+		// the keys so it doesn't shove them off-screen.
+		return footerFlash.Render(m.flash) + "    " + hint
+	}
+	return hint
+}
+
+type kbHint struct{ key, label string }
+
+// selectedAwaitingApproval reports whether the highlighted run is gated on
+// user approval (stack or plan). Used to conditionally surface `a approve`
+// in the footer so it only appears when actually actionable.
+func (m model) selectedAwaitingApproval() bool {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return false
+	}
+	switch readRunPhase(m.repoRoot, m.runs[m.cursor].ID) {
+	case "awaiting_stack", "awaiting_plan", "awaiting_approval":
+		return true
+	}
+	return false
+}
+
+// selectedReadyToMerge reports whether the highlighted run has finished
+// successfully and has a saturn/<id> branch to merge into main. Avoids
+// dangling `m merge` in the hint for runs still in flight or that ran in
+// shared mode (no branch).
+func (m model) selectedReadyToMerge() bool {
+	if len(m.runs) == 0 || m.cursor >= len(m.runs) {
+		return false
+	}
+	r := m.runs[m.cursor]
+	if r.Error != "" || r.StopReason == "" {
+		return false
+	}
+	return branchExistsCached(m.repoRoot, "saturn/"+r.ID)
 }
 
 func (m model) renderListPane(height int) string {
@@ -192,10 +265,21 @@ func (m model) renderDetailPane(width int) string {
 	if backend == "" {
 		backend = "(unset)"
 	}
+	// Combine model + variant on one line so the stat block stays compact.
+	// Falls back to the visually-quiet "(default)" when neither was set,
+	// rather than a blank value that looks like a bug.
+	modelLine := r.Model
+	if modelLine == "" {
+		modelLine = "(default)"
+	}
+	if r.Variant != "" {
+		modelLine += " · " + r.Variant
+	}
 	stats := [][2]string{
 		{"workdir", truncate(r.Workdir, width-12)},
 		{"branch", "saturn/" + r.ID},
 		{"backend", backend},
+		{"model", truncate(modelLine, width-12)},
 		{"iters", fmt.Sprintf("%d", r.Iterations)},
 		{"elapsed", runElapsed(m.repoRoot, r)},
 		{"cost", formatCost(runCost(m.repoRoot, r))},
@@ -286,7 +370,7 @@ func statusLabel(r runInfo) string {
 }
 
 func runElapsed(repoRoot string, r runInfo) string {
-	startedAt, endedAt := readIterTimes(filepath.Join(repoRoot, ".saturn", "runs", r.ID, "iterations.jsonl"))
+	startedAt, endedAt := readIterTimes(filepath.Join(paths.RunDir(repoRoot, r.ID), "iterations.jsonl"))
 	if startedAt.IsZero() {
 		return "—"
 	}
@@ -335,7 +419,7 @@ func formatDuration(d time.Duration) string {
 }
 
 func runCost(repoRoot string, r runInfo) float64 {
-	path := filepath.Join(repoRoot, ".saturn", "runs", r.ID, "events.jsonl")
+	path := filepath.Join(paths.RunDir(repoRoot, r.ID), "events.jsonl")
 	f, err := os.Open(path)
 	if err != nil {
 		return 0
@@ -438,7 +522,7 @@ func hourlyCosts(repoRoot string, runs []runInfo, hours int) []float64 {
 	buckets := make([]float64, hours)
 
 	for _, r := range runs {
-		path := filepath.Join(repoRoot, ".saturn", "runs", r.ID, "events.jsonl")
+		path := filepath.Join(paths.RunDir(repoRoot, r.ID), "events.jsonl")
 		f, err := os.Open(path)
 		if err != nil {
 			continue
@@ -509,7 +593,7 @@ func sparkline(values []float64) string {
 }
 
 func recentMemory(repoRoot string, n int) []string {
-	f, err := os.Open(filepath.Join(repoRoot, ".saturn", "memory.md"))
+	f, err := os.Open(paths.MemoryFile(repoRoot))
 	if err != nil {
 		return nil
 	}

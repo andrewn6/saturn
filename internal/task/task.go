@@ -4,8 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"regexp"
 	"strings"
+
+	"github.com/andrewn6/saturn/internal/slug"
 )
 
 type Source int
@@ -23,17 +24,35 @@ type Task struct {
 	Source    Source
 	Shared    bool
 	Backend   string // "" = auto, "claude", "opencode"
+	Model     string // "" = backend default; e.g. "opus", "anthropic/claude-opus-4-7", "openai/gpt-5"
+	Variant   string // "" = backend default; e.g. "high", "medium", "low", "max", "minimal"
 	Loop      bool   // false = single-shot (default), true = Ralph-style iterate
 	Plan      bool   // true = produce PLAN.md and gate on human approval before execution
 	Architect bool   // true = produce STACK.md (stack/trade-off analysis) and gate before plan/execute
 }
 
-var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
-
-func slugify(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = slugRe.ReplaceAllString(s, "-")
-	return strings.Trim(s, "-")
+// New finalizes a partially-populated Task, enforcing the same invariants
+// ParseFile does: non-empty Prompt, non-empty Title (defaulting to
+// "untitled"), and a deterministic ID derived from the title when not set.
+//
+// Use this anywhere a Task is built outside ParseFile — `saturn plan`
+// emits tasks programmatically, GitHub ingestion synthesizes them, and a
+// future TUI source will too. Keeping this in one place stops the
+// invariants from drifting per source.
+func New(t Task) (*Task, error) {
+	if strings.TrimSpace(t.Prompt) == "" {
+		return nil, fmt.Errorf("task has empty prompt")
+	}
+	if strings.TrimSpace(t.Title) == "" {
+		t.Title = "untitled"
+	}
+	if strings.TrimSpace(t.ID) == "" {
+		t.ID = slug.Make(t.Title)
+		if t.ID == "" {
+			t.ID = "untitled"
+		}
+	}
+	return &t, nil
 }
 
 // ParseFile reads a task markdown file with optional YAML-ish front matter.
@@ -88,6 +107,10 @@ func ParseFile(path string) (*Task, error) {
 				t.Shared = v == "true"
 			case "backend":
 				t.Backend = v
+			case "model":
+				t.Model = v
+			case "variant":
+				t.Variant = v
 			case "loop":
 				t.Loop = v == "true"
 			case "plan":
@@ -110,14 +133,9 @@ func ParseFile(path string) (*Task, error) {
 	}
 
 	t.Prompt = strings.TrimSpace(body.String())
-	if t.Prompt == "" {
-		return nil, fmt.Errorf("task %q has empty prompt", path)
+	out, err := New(*t)
+	if err != nil {
+		return nil, fmt.Errorf("task %q: %w", path, err)
 	}
-	if t.Title == "" {
-		t.Title = "untitled"
-	}
-	if t.ID == "" {
-		t.ID = slugify(t.Title)
-	}
-	return t, nil
+	return out, nil
 }

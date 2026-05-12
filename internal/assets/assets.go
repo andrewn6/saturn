@@ -13,3 +13,6 @@ var PlanPrompt string
 
 //go:embed architect.md
 var ArchitectPrompt string
+
+//go:embed planner.md
+var PlannerPrompt string

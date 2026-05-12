@@ -205,40 +205,49 @@ func (m model) commandPalette() modalState {
 		}
 	}
 
+	// Items are ordered & grouped to match how a user thinks about saturn:
+	// first you Create work, then you Inspect what an agent's doing, then
+	// you Manage state (approve, merge, kill), and Saturn-meta (upgrade,
+	// quit) lives at the bottom. The same groups back the footer hint and
+	// the help affordance, so memorization carries between surfaces.
 	items := []modalItem{
+		// Create
 		{label: "New Task", shortcut: "n", group: "Create",
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openNewTask() }},
 		{label: "New from GitHub Issue", shortcut: "g",
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openNewGH() }},
+		{label: "Open Editor (write task in $EDITOR)", shortcut: "e",
+			action: func(m model) (tea.Model, tea.Cmd) { return m.openEditor() }},
 
-		{label: "Approve current gate (stack/plan)", shortcut: "a", group: "Approval", disabled: !awaiting,
-			action: func(m model) (tea.Model, tea.Cmd) { return m.approveSelected() }},
-		{label: "View STACK.md (architect output)", shortcut: "S", disabled: !hasRuns,
-			action: func(m model) (tea.Model, tea.Cmd) { return m.viewStack() }},
-		{label: "View PLAN.md", shortcut: "P", disabled: !hasRuns,
-			action: func(m model) (tea.Model, tea.Cmd) { return m.viewPlan() }},
-
+		// Inspect
 		{label: "Open Diff", shortcut: "d", group: "Inspect", disabled: !hasRuns,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openDiff() }},
 		{label: "All Diffs Summary", shortcut: "D",
 			action: func(m model) (tea.Model, tea.Cmd) { return m.enterDiffSummary() }},
-		{label: "Open Editor", shortcut: "e", disabled: !hasRuns,
-			action: func(m model) (tea.Model, tea.Cmd) { return m.openEditor() }},
-		{label: "Open Shell", shortcut: "w", disabled: !hasRuns,
-			action: func(m model) (tea.Model, tea.Cmd) { return m.openShell() }},
-		{label: "Attach Claude Session", shortcut: "o", disabled: !hasRuns,
+		{label: "View STACK.md (architect output)", shortcut: "S", disabled: !hasRuns,
+			action: func(m model) (tea.Model, tea.Cmd) { return m.viewStack() }},
+		{label: "View PLAN.md", shortcut: "P", disabled: !hasRuns,
+			action: func(m model) (tea.Model, tea.Cmd) { return m.viewPlan() }},
+		{label: "Attach Agent Session (tmux)", shortcut: "o", disabled: !hasRuns,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openClaude() }},
+		{label: "Open Shell in Worktree", shortcut: "w", disabled: !hasRuns,
+			action: func(m model) (tea.Model, tea.Cmd) { return m.openShell() }},
 
-		{label: "Merge to main", shortcut: "m", group: "Manage", disabled: !hasRuns,
+		// Manage
+		{label: "Approve current gate (stack/plan)", shortcut: "a", group: "Manage", disabled: !awaiting,
+			action: func(m model) (tea.Model, tea.Cmd) { return m.approveSelected() }},
+		{label: "Merge to main", shortcut: "m", disabled: !hasRuns,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.mergeRun() }},
 		{label: "Kill tmux Session", shortcut: "K", disabled: !hasRuns,
 			action: func(m model) (tea.Model, tea.Cmd) { return m.killSession() }},
 		{label: "Refresh", shortcut: "r",
 			action: func(m model) (tea.Model, tea.Cmd) { return m, refreshCmd(m.root) }},
+
+		// Saturn
 		{label: "Upgrade Saturn", shortcut: "u", group: "Saturn",
 			action: func(m model) (tea.Model, tea.Cmd) { return m.openUpdate() }},
 		{label: "Quit", shortcut: "q",
 			action: func(m model) (tea.Model, tea.Cmd) { return m, tea.Quit }},
 	}
-	return newModal("Commands", "↑/↓ choose · enter confirm · esc cancel · type to filter", items)
+	return newModal("Actions", "↑/↓ choose · enter run · / filter · esc close", items)
 }

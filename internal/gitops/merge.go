@@ -5,8 +5,9 @@ package gitops
 import (
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strings"
+
+	"github.com/andrewn6/saturn/internal/paths"
 )
 
 // Conflicts returns the list of paths that would conflict if `branch` were
@@ -71,8 +72,8 @@ func Merge(repoRoot, base, branch string) error {
 // Cleanup removes the worktree and deletes the agent branch after a
 // successful merge. Best-effort: returns the first hard error encountered.
 func Cleanup(repoRoot, taskID string) error {
-	wt := filepath.Join(repoRoot, ".saturn", "wt", taskID)
-	branch := "saturn/" + taskID
+	wt := paths.Worktree(repoRoot, taskID)
+	branch := paths.Branch(taskID)
 
 	if out, err := exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", wt).
 		CombinedOutput(); err != nil {

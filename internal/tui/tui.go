@@ -14,6 +14,7 @@ import (
 
 	"github.com/andrewn6/saturn/internal/agent"
 	"github.com/andrewn6/saturn/internal/gitops"
+	"github.com/andrewn6/saturn/internal/paths"
 	"github.com/andrewn6/saturn/internal/task"
 	"github.com/andrewn6/saturn/internal/tmux"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -51,6 +52,8 @@ type runInfo struct {
 	SessionID  string
 	Workdir    string
 	Backend    string
+	Model      string
+	Variant    string
 }
 
 type model struct {
@@ -88,7 +91,7 @@ type flashMsg string
 // modal can compare it to the latest GitHub release); pass "dev" for source
 // builds and the upgrade flow will always offer the latest tagged release.
 func Run(runsRoot, version string) error {
-	repoRoot := filepath.Dir(filepath.Dir(runsRoot))
+	repoRoot := paths.RepoRootFromRunsRoot(runsRoot)
 
 	gh := textinput.New()
 	gh.Placeholder = "owner/repo#123"
@@ -185,7 +188,11 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "r":
 		return m, refreshCmd(m.root)
-	case "ctrl+p", "/":
+	case "ctrl+p", "/", "?":
+		// All three open the same surface — the command palette doubles as
+		// help. Keeps discovery to one place. ? is the muscle-memory alias
+		// (vim, less, lazygit); ^p is for IDE habit; / starts you in
+		// filter-mode immediately.
 		m.modal = m.commandPalette()
 		m.mode = modeModal
 		return m, textinput.Blink
@@ -589,7 +596,7 @@ func spawnSaturn(repoRoot string, args ...string) {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Dir = repoRoot
-	logPath := filepath.Join(repoRoot, ".saturn", "tui-spawned.log")
+	logPath := paths.TUISpawnedLog(repoRoot)
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 		cmd.Stdout = lf
@@ -761,8 +768,8 @@ func loadRuns(root string) ([]runInfo, error) {
 			continue
 		}
 		info.ID = e.Name()
-		repoRoot := filepath.Dir(filepath.Dir(root))
-		wt := filepath.Join(repoRoot, ".saturn", "wt", e.Name())
+		repoRoot := paths.RepoRootFromRunsRoot(root)
+		wt := paths.Worktree(repoRoot, e.Name())
 		if st, err := os.Stat(wt); err == nil && st.IsDir() {
 			info.Workdir = wt
 		} else {
@@ -790,6 +797,18 @@ func loadRun(dir string) (runInfo, error) {
 		r.StopReason = res.StopReason
 		r.Error = res.Error
 		r.Backend = res.Backend
+	}
+	// Pull model/variant from the cached task.json (written by driveTask
+	// before any phase runs). result.json doesn't carry them because it's
+	// per-phase; the task definition is per-run.
+	if b, err := os.ReadFile(filepath.Join(dir, "task.json")); err == nil {
+		var tj struct {
+			Model   string `json:"Model"`
+			Variant string `json:"Variant"`
+		}
+		_ = json.Unmarshal(b, &tj)
+		r.Model = tj.Model
+		r.Variant = tj.Variant
 	}
 	r.TailLines = tailEvents(filepath.Join(dir, "events.jsonl"), 40)
 	r.SessionID = latestSessionID(filepath.Join(dir, "events.jsonl"))

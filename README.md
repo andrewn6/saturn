@@ -45,6 +45,16 @@ go build -o saturn ./cmd/saturn
 
 ## Usage
 
+Bootstrap a repo (one-time, idempotent):
+
+```sh
+saturn init
+```
+
+This creates `tasks/` (for hand-authored task files), `plans/` (where
+`saturn plan` drops generated batches), and a `.saturn/.gitignore` so the
+per-task worktrees and run logs stay out of git.
+
 A task is a markdown file with optional front matter:
 
 ```markdown
@@ -70,6 +80,22 @@ saturn run --parallel 5 --max-iter 30 tasks/*.md
 saturn run andrewn6/saturn#42        # ingest a GitHub issue as a task
 ```
 
+Don't have a task yet, just a rough idea? Have saturn plan one for you.
+The planner runs in its own throwaway worktree, breaks the idea into
+discrete task files, and drops them into `plans/<date>-<slug>/` for you
+to review:
+
+```sh
+saturn plan "add OIDC login and migrate sessions to Redis"
+saturn plan --from notes/big-refactor.md
+saturn plan --out tasks/oidc "add OIDC login"        # land tasks directly in tasks/
+```
+
+Generated task files are plain markdown — review them, edit them, then
+`saturn run plans/<date>-<slug>/*.md` when you're happy. The planning
+worktree is preserved at `.saturn/wt/_plan-<slug>/` so you can inspect
+the agent's full transcript; pass `--cleanup` to remove it.
+
 Watch live runs in a TUI (attach into the agent's tmux session, view diffs,
 tail events):
 
@@ -94,6 +120,8 @@ worktrees in `.saturn/wt/<task-id>/`.
 
 Currently shipping:
 
+- [x] `saturn init` to scaffold `tasks/`, `plans/`, and `.saturn/.gitignore`
+- [x] `saturn plan` — agent breaks a rough idea into reviewable task files
 - [x] Markdown task files with YAML-ish front matter (`id`, `title`, `backend`, `loop`, `plan`, `shared`)
 - [x] GitHub issue ingestion (`owner/repo#N`) as a task source
 - [x] Per-task git worktrees on `saturn/<task-id>` branches
@@ -112,7 +140,6 @@ Currently shipping:
 
 Roadmap / wanted:
 
-- [ ] `saturn init` to scaffold `tasks/` and config
 - [ ] Resume / replay of an interrupted run from `events.jsonl`
 - [ ] Cost & token accounting per task
 - [ ] More backends (Aider, Codex CLI, Gemini CLI, custom exec)

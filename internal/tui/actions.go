@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/andrewn6/saturn/internal/paths"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -15,7 +16,7 @@ import (
 // "executing", "done") so the TUI can light up the Approve action only when
 // the selected run is gated on human approval.
 func readRunPhase(repoRoot, taskID string) string {
-	b, err := os.ReadFile(filepath.Join(repoRoot, ".saturn", "runs", taskID, "phase"))
+	b, err := os.ReadFile(filepath.Join(paths.RunDir(repoRoot, taskID), "phase"))
 	if err != nil {
 		return ""
 	}
@@ -60,7 +61,7 @@ func (m model) approveSelected() (tea.Model, tea.Cmd) {
 	}
 	cmd := exec.Command(exe, "approve", sel.ID)
 	cmd.Dir = m.repoRoot
-	logPath := filepath.Join(m.repoRoot, ".saturn", "tui-spawned.log")
+	logPath := paths.TUISpawnedLog(m.repoRoot)
 	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 		cmd.Stdout = lf
