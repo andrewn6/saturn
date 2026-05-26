@@ -6,6 +6,7 @@ package agent
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 const (
@@ -120,6 +121,7 @@ func Resolve(name string) string {
 // every time we expose a new backend flag (model, variant today; potentially
 // max-budget, agent name, etc. tomorrow).
 type SpawnOptions struct {
+	Runner  string // custom shell command; receives Prompt on stdin when set
 	Backend string // "" = auto
 	Prompt  string
 	Workdir string
@@ -137,6 +139,13 @@ type SpawnOptions struct {
 // model or variant is "", the flag is omitted and the backend uses its
 // default (matches today's behavior for older tasks without these fields).
 func SpawnCmd(opts SpawnOptions) (*exec.Cmd, error) {
+	if opts.Runner != "" {
+		cmd := exec.Command("sh", "-c", opts.Runner)
+		cmd.Dir = opts.Workdir
+		cmd.Stdin = strings.NewReader(opts.Prompt)
+		return cmd, nil
+	}
+
 	switch Resolve(opts.Backend) {
 	case BackendOpencode:
 		args := []string{"run", opts.Prompt,

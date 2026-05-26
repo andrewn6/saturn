@@ -55,6 +55,21 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "list":
+		if err := listCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "logs":
+		if err := logsCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "cleanup":
+		if err := cleanupCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "watch":
 		if err := watchCmd(); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -179,7 +194,10 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  saturn init    [--force] [--no-example]")
 	fmt.Fprintln(os.Stderr, "  saturn plan    [--out <dir>] [--shared] [--cleanup] [--max-iter N]")
 	fmt.Fprintln(os.Stderr, "                 \"<idea>\" | --from <file.md>")
-	fmt.Fprintln(os.Stderr, "  saturn run     [--max-iter N] [--parallel N] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn run     [--max-iter N] [--parallel N] [--runner <cmd>] <task.md|owner/repo#N>...")
+	fmt.Fprintln(os.Stderr, "  saturn list")
+	fmt.Fprintln(os.Stderr, "  saturn logs    [--phase exec|plan|arch] <task-id>")
+	fmt.Fprintln(os.Stderr, "  saturn cleanup <task-id>...")
 	fmt.Fprintln(os.Stderr, "  saturn merge   [--base main] [--no-cleanup] <task-id>")
 	fmt.Fprintln(os.Stderr, "  saturn approve <task-id>   (resume a plan-mode task after PLAN.md review)")
 	fmt.Fprintln(os.Stderr, "  saturn watch")
@@ -191,6 +209,7 @@ func runCmd(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	maxIter := fs.Int("max-iter", 20, "max loop iterations per task (0 = unlimited)")
 	parallel := fs.Int("parallel", 3, "max concurrent tasks")
+	runnerCmd := fs.String("runner", "", "custom shell command; receives the prompt on stdin")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -212,6 +231,9 @@ func runCmd(args []string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("load %s: %w", p, err)
+		}
+		if *runnerCmd != "" {
+			t.Runner = *runnerCmd
 		}
 		tasks = append(tasks, t)
 	}
@@ -293,6 +315,9 @@ func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) erro
 	branch := paths.Branch(t.ID)
 	if !t.Shared {
 		workdir = paths.Worktree(root, t.ID)
+		if err := os.MkdirAll(filepath.Dir(workdir), 0o755); err != nil {
+			return err
+		}
 		if err := worktree.Add(root, workdir, branch); err != nil {
 			return err
 		}
@@ -363,12 +388,13 @@ func driveTask(ctx context.Context, root string, t *task.Task, maxIter int) erro
 		// fall through: ph is past the plan gate
 	}
 
+	if err := writePhase(runDir, phaseExecuting); err != nil {
+		return err
+	}
 	if err := runPhase(ctx, root, t, workdir, runDir, maxIter, phaseExecuting); err != nil {
 		return err
 	}
-	if t.Plan || t.Architect {
-		_ = writePhase(runDir, phaseDone)
-	}
+	_ = writePhase(runDir, phaseDone)
 	return nil
 }
 
@@ -437,7 +463,7 @@ func runPhase(ctx context.Context, root string, t *task.Task, workdir, runDir st
 	res := map[string]any{
 		"ended_at":   time.Now().Format(time.RFC3339),
 		"iterations": 0,
-		"backend":    agent.Resolve(t.Backend),
+		"backend":    backendName(t),
 		"phase":      shortTag,
 	}
 	if sum != nil {
@@ -549,6 +575,204 @@ func approveCmd(args []string) error {
 		fmt.Fprintf(os.Stderr, "warn: beads unavailable: %v\n", err)
 	}
 	return driveTask(ctx, root, t, *maxIter)
+}
+
+func listCmd(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: saturn list")
+	}
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(paths.RunsRoot(root))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		runDir := filepath.Join(paths.RunsRoot(root), e.Name())
+		phase := readPhase(runDir)
+		if phase == "" {
+			phase = "unknown"
+		}
+		res := readResult(resultPathForPhase(runDir, phase))
+		status := strings.TrimSpace(res.StopReason)
+		if isAwaitingPhase(phase) {
+			status = "awaiting"
+		} else if res.Error != "" {
+			status = "error"
+		} else if status == "" && phase != phaseDone {
+			status = "running"
+		} else if status == "" {
+			status = "done"
+		}
+		fmt.Printf("%s\t%s\t%s\t%s\n", e.Name(), phase, status, res.EndedAt)
+	}
+	return nil
+}
+
+func logsCmd(args []string) error {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	phase := fs.String("phase", "", "log phase: exec, plan, or arch (default: infer from current phase)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: saturn logs [--phase exec|plan|arch] <task-id>")
+	}
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	phaseName := *phase
+	if phaseName == "" {
+		phaseName = phaseForLog(readPhase(paths.RunDir(root, fs.Arg(0))))
+	} else if !validLogPhase(phaseName) {
+		return fmt.Errorf("unknown phase %q", phaseName)
+	}
+	logSuffix := logSuffixForPhase(phaseName)
+	b, err := os.ReadFile(filepath.Join(paths.RunDir(root, fs.Arg(0)), "events"+logSuffix+".jsonl"))
+	if err != nil && *phase == "" && logSuffix != "" {
+		b, err = os.ReadFile(filepath.Join(paths.RunDir(root, fs.Arg(0)), "events.jsonl"))
+	}
+	if err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(b)
+	return err
+}
+
+func validLogPhase(phase string) bool {
+	switch phase {
+	case "exec", "plan", "arch", "architect":
+		return true
+	default:
+		return false
+	}
+}
+
+func logSuffixForPhase(phase string) string {
+	switch phase {
+	case "", "exec":
+		return ""
+	case "plan":
+		return ".plan"
+	case "arch", "architect":
+		return ".architect"
+	default:
+		return ""
+	}
+}
+
+func phaseForLog(phase string) string {
+	switch phase {
+	case phaseArchitecting, phaseAwaitingStack:
+		return "arch"
+	case phasePlanning, phaseAwaitingPlan, phaseAwaitingApproval:
+		return "plan"
+	default:
+		return "exec"
+	}
+}
+
+func cleanupCmd(args []string) error {
+	fs := flag.NewFlagSet("cleanup", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("usage: saturn cleanup <task-id>...")
+	}
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	for _, id := range fs.Args() {
+		runDir := paths.RunDir(root, id)
+		if !isSharedRun(runDir) {
+			if err := gitops.Cleanup(root, id); err != nil {
+				return err
+			}
+		}
+		if err := os.RemoveAll(runDir); err != nil {
+			return fmt.Errorf("remove run state %s: %w", id, err)
+		}
+		fmt.Printf("cleaned %s\n", id)
+	}
+	return nil
+}
+
+type resultSummary struct {
+	EndedAt    string `json:"ended_at"`
+	StopReason string `json:"stop_reason"`
+	Error      string `json:"error"`
+}
+
+func readResult(path string) resultSummary {
+	var res resultSummary
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return res
+	}
+	_ = json.Unmarshal(b, &res)
+	return res
+}
+
+func resultPathForPhase(runDir, phase string) string {
+	switch phase {
+	case phaseArchitecting, phaseAwaitingStack:
+		return filepath.Join(runDir, "result.architect.json")
+	case phasePlanning, phaseAwaitingPlan, phaseAwaitingApproval:
+		return filepath.Join(runDir, "result.plan.json")
+	default:
+		return filepath.Join(runDir, "result.json")
+	}
+}
+
+func isAwaitingPhase(phase string) bool {
+	switch phase {
+	case phaseAwaitingStack, phaseAwaitingPlan, phaseAwaitingApproval:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSharedRun(runDir string) bool {
+	b, err := os.ReadFile(filepath.Join(runDir, "task.json"))
+	if err != nil {
+		return false
+	}
+	var t task.Task
+	if err := json.Unmarshal(b, &t); err != nil {
+		return false
+	}
+	return t.Shared
+}
+
+func repoRoot() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return worktree.RepoRoot(cwd)
+}
+
+func backendName(t *task.Task) string {
+	if t.Runner != "" {
+		return "custom"
+	}
+	return agent.Resolve(t.Backend)
 }
 
 func suffix(s string) string {
