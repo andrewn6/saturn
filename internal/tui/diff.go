@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -71,6 +73,48 @@ func (m model) enterDiffView(branch string, prev mode) (tea.Model, tea.Cmd) {
 	vp := viewport.New(right, h-6)
 	m.diff = diffViewState{
 		branch:   branch,
+		files:    files,
+		fileIdx:  0,
+		vp:       vp,
+		focus:    0,
+		prevMode: prev,
+		ready:    true,
+	}
+	m.diff.vp.SetContent(renderFileDiff(files[0], right))
+	m.mode = modeDiffView
+	m.flash = ""
+	return m, nil
+}
+
+func (m model) enterWorkdirDiffView(sel runInfo, prev mode) (tea.Model, tea.Cmd) {
+	workdir := sel.Workdir
+	if workdir == "" {
+		workdir = m.repoRoot
+	}
+	files, err := parseWorkdirDiff(workdir)
+	if err != nil {
+		m.flash = "diff: " + err.Error()
+		return m, nil
+	}
+	if len(files) == 0 {
+		m.flash = "no branch saturn/" + sel.ID + " and no working-tree changes in " + workdir
+		return m, nil
+	}
+	w, h := m.width, m.height
+	if w == 0 {
+		w, h = 100, 30
+	}
+	left := w / 3
+	if left < 30 {
+		left = 30
+	}
+	right := w - left - 6
+	if right < 30 {
+		right = 30
+	}
+	vp := viewport.New(right, h-6)
+	m.diff = diffViewState{
+		branch:   "worktree/" + sel.ID,
 		files:    files,
 		fileIdx:  0,
 		vp:       vp,
@@ -271,6 +315,51 @@ func parseDiff(repoRoot, base, branch string) ([]fileDiff, error) {
 		return nil, err
 	}
 	return splitFiles(string(out)), nil
+}
+
+func parseWorkdirDiff(workdir string) ([]fileDiff, error) {
+	cmd := exec.Command("git", "-C", workdir, "diff", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var b strings.Builder
+	b.Write(out)
+
+	untracked, err := untrackedFiles(workdir)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range untracked {
+		fileOut, err := exec.Command("git", "-C", workdir, "diff", "--no-index", "--", os.DevNull, p).CombinedOutput()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+				return nil, err
+			}
+		}
+		b.Write(fileOut)
+	}
+	return splitFiles(normalizeNoIndexDiff(workdir, b.String())), nil
+}
+
+func untrackedFiles(workdir string) ([]string, error) {
+	out, err := exec.Command("git", "-C", workdir, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			files = append(files, p)
+		}
+	}
+	return files, nil
+}
+
+func normalizeNoIndexDiff(workdir, in string) string {
+	devNull := filepath.ToSlash(os.DevNull)
+	workdir = filepath.ToSlash(workdir)
+	return strings.ReplaceAll(strings.ReplaceAll(in, "a/"+devNull, "a/dev/null"), "b/"+workdir+"/", "b/")
 }
 
 func splitFiles(in string) []fileDiff {

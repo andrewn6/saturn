@@ -233,8 +233,7 @@ func (m model) openDiff() (tea.Model, tea.Cmd) {
 	sel := m.runs[m.cursor]
 	branch := "saturn/" + sel.ID
 	if !branchExists(m.repoRoot, branch) {
-		m.flash = "no branch saturn/" + sel.ID + " (shared mode? press w to shell in)"
-		return m, nil
+		return m.enterWorkdirDiffView(sel, modeList)
 	}
 	return m.enterDiffView(branch, modeList)
 }
